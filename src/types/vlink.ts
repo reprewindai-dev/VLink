@@ -86,6 +86,21 @@ export interface VLinkActivityEvent {
   metadata: Record<string, string | number | boolean | null>;
 }
 
+export interface VLinkEnrollmentGrant {
+  grantId: string;
+  vlinkId: string;
+  token: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+export interface VLinkEnrollmentGrantSummary {
+  grantId: string;
+  vlinkId: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
 export type VLinkPairingStatus = "pending" | "approved" | "exchanged" | "expired";
 
 export interface VLinkPairingRequest {
