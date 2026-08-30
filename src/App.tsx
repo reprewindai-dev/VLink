@@ -45,10 +45,15 @@ export default function App() {
 
   const snippet = useMemo(() => {
     if (!vlink) return "";
-    if (vlink.sourceType === "webhook") return vlink.endpoints.webhookIngressUrl;
-    if (vlink.sourceType === "cicd") return `VLINK_ID=${vlink.vlinkId}\nOPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
-    if (vlink.sourceType === "container") return `-e VLINK_ID=${vlink.vlinkId} -e OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
-    return `OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}\nVLINK_ID=${vlink.vlinkId}`;
+    if (vlink.sourceType === "webhook" || vlink.sourceType === "api-service") {
+      return vlink.endpoints.webhookIngressUrl;
+    }
+    if (vlink.sourceType === "agent-mcp") {
+      return `OpenAI-compatible now: ${vlink.endpoints.openaiCompatibleBaseUrl}\nMCP endpoint (planned transport): ${vlink.endpoints.mcpEndpoint}`;
+    }
+    if (vlink.sourceType === "cicd") return `OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
+    if (vlink.sourceType === "container") return `-e OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
+    return `OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
   }, [vlink]);
 
   const createVLink = async () => {
@@ -108,7 +113,7 @@ export default function App() {
       <section className="hero">
         <div className="brand"><span className="brandMark">V</span><span>VLink</span></div>
         <h1>Connect first. Observe reality. Govern what matters.</h1>
-        <p>VLink is the portable connection layer into Veklom. Create one link, choose what you are connecting, use the generated endpoint or pairing flow, and verify the first activity event.</p>
+        <p>VLink is the portable connection layer into Veklom. Create one link, choose what you are connecting, use the generated VLink-specific endpoint or pairing flow, and verify the first activity event. No custom VLink header is required when you use the generated connection URL.</p>
         <div className="truthBadge"><ShieldCheck size={16}/> Activity records are metadata, not cryptographic receipts.</div>
       </section>
 
