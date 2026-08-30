@@ -34,6 +34,15 @@ export default function App() {
   const [qr, setQr] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [pairingInfo, setPairingInfo] = useState<Partial<VLinkPairingRequest> | null>(null);
+  const [pairingApproval, setPairingApproval] = useState<"idle" | "approved" | "failed">("idle");
+
+  const pairingTarget = useMemo(() => {
+    const match = window.location.pathname.match(/^\/pair\/([^/]+)\/([^/]+)$/);
+    if (!match) return null;
+    const code = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("code");
+    return { vlinkId: decodeURIComponent(match[1]), pairingId: decodeURIComponent(match[2]), code };
+  }, []);
 
   useEffect(() => {
     if (!pairing?.qrPayload) {
@@ -43,12 +52,24 @@ export default function App() {
     QRCode.toDataURL(pairing.qrPayload, { margin: 1, width: 220 }).then(setQr).catch(() => setQr(""));
   }, [pairing]);
 
+  useEffect(() => {
+    if (!pairingTarget) return;
+    api<{ pairing: Partial<VLinkPairingRequest> }>(
+      `/api/v1/vlinks/${pairingTarget.vlinkId}/pairing/${pairingTarget.pairingId}`,
+    ).then((result) => setPairingInfo(result.pairing)).catch(() => setPairingInfo(null));
+  }, [pairingTarget]);
+
   const snippet = useMemo(() => {
     if (!vlink) return "";
-    if (vlink.sourceType === "webhook") return vlink.endpoints.webhookIngressUrl;
-    if (vlink.sourceType === "cicd") return `VLINK_ID=${vlink.vlinkId}\nOPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
-    if (vlink.sourceType === "container") return `-e VLINK_ID=${vlink.vlinkId} -e OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
-    return `OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}\nVLINK_ID=${vlink.vlinkId}`;
+    if (vlink.sourceType === "webhook" || vlink.sourceType === "api-service") {
+      return vlink.endpoints.webhookIngressUrl;
+    }
+    if (vlink.sourceType === "agent-mcp") {
+      return `OpenAI-compatible now: ${vlink.endpoints.openaiCompatibleBaseUrl}\nMCP endpoint (planned transport): ${vlink.endpoints.mcpEndpoint}`;
+    }
+    if (vlink.sourceType === "cicd") return `OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
+    if (vlink.sourceType === "container") return `-e OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
+    return `OPENAI_BASE_URL=${vlink.endpoints.openaiCompatibleBaseUrl}`;
   }, [vlink]);
 
   const createVLink = async () => {
@@ -101,14 +122,57 @@ export default function App() {
     }
   };
 
+  const approvePairing = async () => {
+    if (!pairingTarget?.code) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/v1/vlinks/${pairingTarget.vlinkId}/pairing/${pairingTarget.pairingId}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ oneTimeCode: pairingTarget.code }),
+      });
+      setPairingApproval("approved");
+      window.history.replaceState({}, "", window.location.pathname);
+    } catch (e) {
+      setPairingApproval("failed");
+      setError(e instanceof Error ? e.message : "Pairing approval failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const copy = (text: string) => navigator.clipboard?.writeText(text);
+
+  if (pairingTarget) {
+    return (
+      <main className="shell">
+        <section className="hero">
+          <div className="brand"><span className="brandMark">V</span><span>VLink</span></div>
+          <h1>Approve this VLink pairing.</h1>
+          <p>This is a one-time enrollment request. Approval marks this browser/device as paired to the requested VLink; it does not create a permanent API key.</p>
+        </section>
+        <section className="card">
+          <div className="eyebrow">PAIRING REQUEST</div>
+          <h2>{pairingApproval === "approved" ? "Pairing approved" : "Confirm connection"}</h2>
+          <div className="statusRow"><code>{pairingTarget.vlinkId}</code><code>{pairingTarget.pairingId}</code></div>
+          {pairingInfo?.expiresAt && <p>Expires at {new Date(pairingInfo.expiresAt).toLocaleString()}.</p>}
+          {!pairingTarget.code && <div className="error">This page has no one-time enrollment code. Open it from the VLink QR code.</div>}
+          {pairingApproval === "approved" ? <div className="truthBadge"><CheckCircle2 size={16}/> Paired successfully. The one-time code cannot be reused.</div> :
+            <button className="primary" disabled={busy || !pairingTarget.code || pairingInfo?.status === "expired"} onClick={approvePairing}>
+              <ShieldCheck size={17}/> {busy ? "Approving…" : "Approve pairing"}
+            </button>}
+          {pairingApproval === "failed" && error && <div className="error">{error}</div>}
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="shell">
       <section className="hero">
         <div className="brand"><span className="brandMark">V</span><span>VLink</span></div>
         <h1>Connect first. Observe reality. Govern what matters.</h1>
-        <p>VLink is the portable connection layer into Veklom. Create one link, choose what you are connecting, use the generated endpoint or pairing flow, and verify the first activity event.</p>
+        <p>VLink is the portable connection layer into Veklom. Create one link, choose what you are connecting, use the generated VLink-specific endpoint or pairing flow, and verify the first activity event. No custom VLink header is required when you use the generated connection URL.</p>
         <div className="truthBadge"><ShieldCheck size={16}/> Activity records are metadata, not cryptographic receipts.</div>
       </section>
 
@@ -142,7 +206,7 @@ export default function App() {
       </section>
 
       {pairing && <section className="card pairing">
-        <div><div className="eyebrow">PAIRING</div><h2>Short-lived one-time enrollment</h2><p>Expires at {new Date(pairing.expiresAt).toLocaleTimeString()}. The QR payload contains a one-time enrollment code, not a reusable API key.</p><code>{pairing.pairingId}</code></div>
+        <div><div className="eyebrow">PAIRING</div><h2>Short-lived one-time enrollment</h2><p>Expires at {new Date(pairing.expiresAt).toLocaleTimeString()}. Scan the QR to open a browser approval page. Its one-time code lives only in the URL fragment and is not a reusable API key.</p><code>{pairing.pairingId}</code></div>
         {qr && <img src={qr} alt="VLink pairing QR code"/>}
       </section>}
 

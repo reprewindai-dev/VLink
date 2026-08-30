@@ -80,11 +80,23 @@ export function createApp(options: CreateAppOptions = {}) {
     next();
   });
 
-  const requireKnownVLink = (req: Request, res: Response): string | undefined | null => {
-    const vlinkId = getBoundVLinkId(req);
+  const resolveVLinkBinding = (req: Request, res: Response, forcedVLinkId?: string): string | undefined | null => {
+    const suppliedVLinkId = getBoundVLinkId(req);
+    if (forcedVLinkId && suppliedVLinkId && suppliedVLinkId !== forcedVLinkId) {
+      res.status(400).json({
+        error: "vlink_binding_conflict",
+        message: "The VLink ID in the connection URL does not match the supplied header/query binding.",
+      });
+      return null;
+    }
+
+    const vlinkId = forcedVLinkId || suppliedVLinkId;
     if (!vlinkId) return undefined;
     if (!registry.get(vlinkId)) {
-      res.status(400).json({ error: "invalid_vlink_id", message: "The supplied VLink ID does not exist." });
+      res.status(forcedVLinkId ? 404 : 400).json({
+        error: "invalid_vlink_id",
+        message: "The supplied VLink ID does not exist.",
+      });
       return null;
     }
     return vlinkId;
@@ -230,7 +242,7 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   app.post("/api/v1/webhooks/:connectorId", (req, res) => {
-    const bound = requireKnownVLink(req, res);
+    const bound = resolveVLinkBinding(req, res);
     if (bound === null) return;
     let eventId: string | undefined;
     if (bound) {
@@ -251,20 +263,30 @@ export function createApp(options: CreateAppOptions = {}) {
     res.status(202).json({ accepted: true, connectorId: req.params.connectorId, vlinkId: bound ?? null, eventId: eventId ?? null });
   });
 
-  app.get("/v1/models", (_req, res) => {
+  const sendModels = (res: Response, bound?: string) => {
     const configuredModel = process.env.GEMINI_MODEL || "gemini-configured-model";
     res.json({
       object: "list",
       data: process.env.GEMINI_API_KEY
         ? [{ id: configuredModel, object: "model", owned_by: "google", availability: "configured" }]
         : [],
-      metadata: { providerConfigured: Boolean(process.env.GEMINI_API_KEY), demoResponsesEnabled: enableDemoResponses },
+      metadata: {
+        providerConfigured: Boolean(process.env.GEMINI_API_KEY),
+        demoResponsesEnabled: enableDemoResponses,
+        vlinkId: bound ?? null,
+      },
     });
-  });
+  };
 
-  app.post("/v1/chat/completions", async (req, res) => {
-    const bound = requireKnownVLink(req, res);
+  const handleChatCompletions = async (
+    req: Request,
+    res: Response,
+    forcedVLinkId?: string,
+    activityRoute = "/v1/chat/completions",
+  ) => {
+    const bound = resolveVLinkBinding(req, res, forcedVLinkId);
     if (bound === null) return;
+
     const started = performance.now();
     const targetHeader = req.header("x-target-url");
     let backend = "unconfigured";
@@ -276,7 +298,10 @@ export function createApp(options: CreateAppOptions = {}) {
         backend = target.hostname;
         const upstream = await fetch(target, {
           method: "POST",
-          headers: { "content-type": "application/json", ...(req.header("authorization") ? { authorization: req.header("authorization")! } : {}) },
+          headers: {
+            "content-type": "application/json",
+            ...(req.header("authorization") ? { authorization: req.header("authorization")! } : {}),
+          },
           body: JSON.stringify(req.body ?? {}),
           signal: AbortSignal.timeout(10_000),
         });
@@ -288,7 +313,12 @@ export function createApp(options: CreateAppOptions = {}) {
         backend = "gemini";
         const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
         const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-        const prompt = messages.map((m: { role?: string; content?: unknown }) => `${m.role ?? "user"}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`).join("\n");
+        const prompt = messages
+          .map(
+            (m: { role?: string; content?: unknown }) =>
+              `${m.role ?? "user"}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`,
+          )
+          .join("\n");
         const model = process.env.GEMINI_MODEL || req.body?.model;
         if (!model) throw new Error("Set GEMINI_MODEL or provide a model in the request");
         const result = await ai.models.generateContent({ model, contents: prompt || "Hello" });
@@ -298,7 +328,7 @@ export function createApp(options: CreateAppOptions = {}) {
           created: Math.floor(Date.now() / 1000),
           model,
           choices: [{ index: 0, message: { role: "assistant", content: result.text ?? "" }, finish_reason: "stop" }],
-          metadata: { executionMode: "live", routedBy: "VLink" },
+          metadata: { executionMode: "live", routedBy: "VLink", vlinkId: bound ?? null },
         });
       } else if (enableDemoResponses) {
         backend = "demo";
@@ -307,17 +337,30 @@ export function createApp(options: CreateAppOptions = {}) {
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: req.body?.model ?? "demo",
-          choices: [{ index: 0, message: { role: "assistant", content: "[DEMO RESPONSE] No live provider is configured." }, finish_reason: "stop" }],
-          metadata: { executionMode: "demo", providerConfigured: false, routedBy: "VLink" },
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: "[DEMO RESPONSE] No live provider is configured." },
+              finish_reason: "stop",
+            },
+          ],
+          metadata: { executionMode: "demo", providerConfigured: false, routedBy: "VLink", vlinkId: bound ?? null },
         });
       } else {
         status = "failed";
-        res.status(503).json({ error: "provider_not_configured", message: "Configure GEMINI_API_KEY/GEMINI_MODEL or an allowlisted X-Target-Url. Demo responses are disabled by default." });
+        res.status(503).json({
+          error: "provider_not_configured",
+          message:
+            "Configure GEMINI_API_KEY/GEMINI_MODEL or an allowlisted X-Target-Url. Demo responses are disabled by default.",
+        });
       }
     } catch (error) {
       status = "failed";
       if (!res.headersSent) {
-        res.status(502).json({ error: "upstream_failure", message: error instanceof Error ? error.message : "Unknown upstream error" });
+        res.status(502).json({
+          error: "upstream_failure",
+          message: error instanceof Error ? error.message : "Unknown upstream error",
+        });
       }
     } finally {
       if (bound) {
@@ -325,23 +368,46 @@ export function createApp(options: CreateAppOptions = {}) {
         registry.addActivity({
           vlinkId: bound,
           sourceType: vlink.sourceType,
-          route: "/v1/chat/completions",
+          route: activityRoute,
           method: "POST",
           mode: vlink.mode,
           status,
           latencyMs: Math.max(0, Math.round(performance.now() - started)),
           backend,
-          metadata: { requestBodyStored: false, responseBodyStored: false, executionMode: backend === "demo" ? "demo" : "live-or-forwarded" },
+          metadata: {
+            requestBodyStored: false,
+            responseBodyStored: false,
+            executionMode: backend === "demo" ? "demo" : "live-or-forwarded",
+            binding: forcedVLinkId ? "connection-url" : "header-or-query",
+          },
         });
       }
     }
+  };
+
+  app.get("/v1/models", (req, res) => {
+    const bound = resolveVLinkBinding(req, res);
+    if (bound === null) return;
+    sendModels(res, bound);
   });
+
+  app.post("/v1/chat/completions", (req, res) => handleChatCompletions(req, res));
+
+  app.get("/vlinks/:vlinkId/v1/models", (req, res) => {
+    const bound = resolveVLinkBinding(req, res, req.params.vlinkId);
+    if (bound === null || !bound) return;
+    sendModels(res, bound);
+  });
+
+  app.post("/vlinks/:vlinkId/v1/chat/completions", (req, res) =>
+    handleChatCompletions(req, res, req.params.vlinkId, "/vlinks/:vlinkId/v1/chat/completions"),
+  );
 
   app.get("/mcp/v1", (_req, res) => {
     res.status(501).json({ status: "planned", protocol: "mcp", message: "VLink publishes an MCP endpoint placeholder; full MCP transport is not implemented in this release." });
   });
 
-  app.use((_req, res) => res.status(404).json({ error: "not_found" }));
+  app.use(["/api", "/v1", "/mcp", "/vlinks"], (_req, res) => res.status(404).json({ error: "not_found" }));
 
   return { app, registry };
 }

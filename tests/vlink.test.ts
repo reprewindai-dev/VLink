@@ -6,6 +6,7 @@ import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
 
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({ registry, publicOrigin: "https://connect.example.test", enableDemoResponses: true });
+app.get("*", (_req, res) => res.status(200).type("text/plain").send("ui-fallback"));
 let base = "";
 let server: ReturnType<typeof app.listen>;
 
@@ -29,6 +30,20 @@ async function createVLink() {
   return (await response.json()).vlink as { vlinkId: string };
 }
 
+test("browser routes fall through to the UI layer while API misses stay fail-closed", async () => {
+  const root = await fetch(`${base}/`);
+  assert.equal(root.status, 200);
+  assert.equal(await root.text(), "ui-fallback");
+
+  const pairingPage = await fetch(`${base}/pair/vlk_example/pair_example`);
+  assert.equal(pairingPage.status, 200);
+  assert.equal(await pairingPage.text(), "ui-fallback");
+
+  const missingApi = await fetch(`${base}/api/not-a-real-route`);
+  assert.equal(missingApi.status, 404);
+  assert.equal((await missingApi.json()).error, "not_found");
+});
+
 test("VLink creation and retrieval", async () => {
   const created = await createVLink();
   const response = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}`);
@@ -46,6 +61,85 @@ test("manifest contains no reusable secrets", async () => {
   for (const forbidden of ["api_key", "apikey", "bearer ", "oneTimeCode", "privateKey", "secret"]) {
     assert.equal(text.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
   }
+});
+
+test("VLink manifest exposes a self-binding OpenAI-compatible base URL", async () => {
+  const created = await createVLink();
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/manifest`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.endpoints.openaiCompatibleBaseUrl, `https://connect.example.test/vlinks/${created.vlinkId}/v1`);
+});
+
+test("endpoint-swap route binds activity without a custom VLink header", async () => {
+  const created = await createVLink();
+  const response = await fetch(`${base}/vlinks/${created.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "hello through the VLink URL" }] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.metadata.vlinkId, created.vlinkId);
+  const events = registry.activity(created.vlinkId);
+  assert.equal(events[0].route, "/vlinks/:vlinkId/v1/chat/completions");
+  assert.equal(events[0].metadata.binding, "connection-url");
+});
+
+test("endpoint-swap route rejects a conflicting VLink header", async () => {
+  const first = await createVLink();
+  const second = await createVLink();
+  const response = await fetch(`${base}/vlinks/${first.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-vlink-id": second.vlinkId },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "conflict" }] }),
+  });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, "vlink_binding_conflict");
+});
+
+test("endpoint-swap route rejects unknown VLink IDs", async () => {
+  const response = await fetch(`${base}/vlinks/vlk_unknown/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "unknown" }] }),
+  });
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).error, "invalid_vlink_id");
+});
+
+test("pairing QR payload is a browser approval URL with a fragment-only one-time code", () => {
+  const record = registry.create({ workspaceId: "ws", environment: "dev", displayName: "Pair", sourceType: "local-project" }, "https://connect.example.test");
+  const pairing = registry.createPairing(record.vlinkId, "https://connect.example.test", 600)!;
+  assert.equal(pairing.pairingUrl, `https://connect.example.test/pair/${record.vlinkId}/${pairing.pairingId}`);
+  assert.ok(pairing.qrPayload.startsWith(`${pairing.pairingUrl}#code=`));
+  assert.equal(pairing.pairingUrl.includes(pairing.oneTimeCode), false);
+  assert.equal(pairing.qrPayload.toLowerCase().includes("api_key"), false);
+});
+
+test("pairing completion is one-time and public status never exposes the code", async () => {
+  const created = await createVLink();
+  const createResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttlSeconds: 600 }),
+  });
+  assert.equal(createResponse.status, 201);
+  const createdPairing = (await createResponse.json()).pairing;
+
+  const statusResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing/${createdPairing.pairingId}`);
+  const statusText = await statusResponse.text();
+  assert.equal(statusResponse.status, 200);
+  assert.equal(statusText.includes(createdPairing.oneTimeCode), false);
+  assert.equal(statusText.includes("qrPayload"), false);
+
+  const complete = () => fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing/${createdPairing.pairingId}/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ oneTimeCode: createdPairing.oneTimeCode }),
+  });
+  assert.equal((await complete()).status, 200);
+  assert.equal((await complete()).status, 400);
 });
 
 test("expired pairing cannot complete", () => {
