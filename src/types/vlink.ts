@@ -98,6 +98,15 @@ export interface VLinkPairingRequest {
   status: VLinkPairingStatus;
   createdAt: string;
   expiresAt: string;
+}
+
+export interface VLinkPairingStatusView {
+  pairingId: string;
+  vlinkId: string;
+  pairingUrl: string;
+  status: VLinkPairingStatus;
+  createdAt: string;
+  expiresAt: string;
   approvedAt?: string;
   exchangedAt?: string;
 }
