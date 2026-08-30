@@ -49,7 +49,7 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       sourceType: input.sourceType,
       mode: "observe",
       endpoints: {
-        openaiCompatibleBaseUrl: `${root}/v1`,
+        openaiCompatibleBaseUrl: `${root}/vlinks/${vlinkId}/v1`,
         webhookIngressUrl: `${root}/api/v1/vlinks/${vlinkId}/webhook`,
         mcpEndpoint: `${root}/mcp/v1`,
         activityViewerUrl: `${root}/?vlink=${vlinkId}`,
