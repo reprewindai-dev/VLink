@@ -15,7 +15,8 @@ The first release follows one product flow:
 - VLink create/list/read endpoints.
 - Non-secret machine-readable manifests at `/.well-known/vlink.json` and `/api/v1/vlinks/:vlinkId/manifest`.
 - A self-binding OpenAI-compatible base URL for every VLink: `/vlinks/<vlink-id>/v1`. Normal compatible clients can change one base URL without adding a custom VLink header.
-- Short-lived, one-time pairing requests. QR payloads contain an expiring enrollment code, never a reusable API key.
+- Short-lived, one-time browser pairing requests. QR codes open an approval page and keep the approval code in the URL fragment so it is not sent in the browser request path/query.
+- Pairing status responses strip the one-time code, and successful approval cannot be replayed.
 - A real internal connection-test route that creates a VLink-bound activity event.
 - VLink activity timeline endpoint.
 - Dedicated VLink webhook ingress plus compatibility with the prototype webhook route.
@@ -24,7 +25,8 @@ The first release follows one product flow:
 - Live Gemini execution when `GEMINI_API_KEY` and a model are configured.
 - Explicit demo responses only when `VLINK_ENABLE_DEMO_RESPONSES=true`.
 - Custom HTTP target forwarding only to hosts explicitly listed in `VLINK_ALLOWED_TARGET_HOSTS`.
-- React UI for Create VLink, generated setup text, pairing QR, connection test, and activity display.
+- React UI for Create VLink, one-URL setup text, pairing QR/browser approval, connection test, and activity display.
+- Browser routes deliberately fall through to the Vite/static SPA while missing API routes remain fail-closed JSON 404s.
 
 ## Not claimed / not implemented yet
 
@@ -34,6 +36,7 @@ VLink does **not** currently claim any of the following:
 - Durable database persistence.
 - Production SPIFFE/SPIRE workload identity issuance or verification.
 - Production authentication/authorization for VLink management or execution traffic.
+- A post-pairing workload access credential. The current pairing flow proves one-time user approval; credential issuance/exchange is the next security slice.
 - Hardware attestation or enclave verification.
 - Formal non-repudiation.
 - Verified multi-cloud failover or zero-downtime switching.
@@ -58,6 +61,8 @@ npm test
 npm run lint
 npm run build
 ```
+
+The current boundary suite covers VLink creation, secret-free manifests, endpoint-swap binding, conflicting/unknown IDs, one-time browser pairing, pairing expiry/replay, UI-route fallthrough, API fail-closed behavior, VLink-bound activity, and prototype OpenAI/webhook compatibility.
 
 ## Environment variables
 
@@ -121,13 +126,25 @@ Read activity:
 curl http://localhost:3000/api/v1/vlinks/<vlink-id>/activity
 ```
 
+Start browser pairing:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/vlinks/<vlink-id>/pairing \
+  -H 'content-type: application/json' \
+  -d '{"ttlSeconds":600}'
+```
+
+The creator receives an expiring QR payload. Scanning it opens `/pair/<vlink-id>/<pairing-id>#code=<one-time-code>`. The fragment is processed by the browser UI and is not part of the HTTP request URL sent to the server. Approval is explicit and one-time.
+
 Without a configured live provider, model execution returns `503` unless demo responses were deliberately enabled.
 
 ## Security posture of this release
 
 - **A VLink ID is a connection identifier, not authentication or authority.** Putting it in the URL makes connection binding frictionless; it does not make possession of the URL sufficient authorization for a production deployment.
 - Manifests contain connection metadata only; pairing secrets are not published in manifests.
-- Pairing codes are short-lived and one-time use.
+- Pairing approval codes are short-lived and one-time use.
+- Pairing approval codes live in a browser URL fragment, not the server-visible path or query string.
+- Public pairing-status responses strip the approval code and QR payload.
 - Unknown user-supplied VLink IDs are rejected before events are recorded.
 - A VLink-specific URL rejects a contradictory `X-VLink-Id`/query binding rather than silently reassigning the activity.
 - Webhook request bodies are accepted by the ingress route but are **not persisted** by the in-memory activity store; activity records store metadata such as payload size.
@@ -143,7 +160,7 @@ Veklom Capability OS
               ├── portable connection object
               ├── self-binding connection URL
               ├── non-secret discovery manifest
-              ├── short-lived enrollment / pairing
+              ├── short-lived browser approval / pairing
               ├── OpenAI-compatible ingress
               ├── webhook ingress
               ├── activity events
