@@ -1,34 +1,123 @@
 import assert from "node:assert/strict";
-import { after, before, test } from "node:test";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { after, before, test } from "node:test";
 import { createApp } from "../src/server/app";
 import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
 
 const registry = new InMemoryVLinkRegistry();
-const { app } = createApp({ registry, publicOrigin: "https://connect.example.test", enableDemoResponses: true });
+const { app } = createApp({
+  registry,
+  publicOrigin: "https://connect.example.test",
+  enableDemoResponses: true,
+  accessTokenTtlSeconds: 3600,
+  enrollmentGrantTtlSeconds: 900,
+});
 app.get("*", (_req, res) => res.status(200).type("text/plain").send("ui-fallback"));
+
 let base = "";
 let server: ReturnType<typeof app.listen>;
+let targetBase = "";
+let targetAuthorization: string | undefined;
+const targetServer = createServer((req, res) => {
+  targetAuthorization = req.headers.authorization;
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true }));
+});
 
 before(async () => {
   server = app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => server.once("listening", () => resolve()));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+  targetServer.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => targetServer.once("listening", () => resolve()));
+  targetBase = `http://127.0.0.1:${(targetServer.address() as AddressInfo).port}`;
 });
 
 after(async () => {
-  await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  await Promise.all([
+    new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
+    new Promise<void>((resolve, reject) => targetServer.close((err) => (err ? reject(err) : resolve()))),
+  ]);
 });
 
-async function createVLink() {
+type CreatedVLink = {
+  vlink: { vlinkId: string; mode: string; endpoints: { openaiCompatibleBaseUrl: string } };
+  enrollmentGrant: { grantId: string; vlinkId: string; token: string; issuedAt: string; expiresAt: string };
+};
+
+type Pairing = {
+  pairingId: string;
+  vlinkId: string;
+  approvalCode: string;
+  deviceCode: string;
+  pairingUrl: string;
+  qrPayload: string;
+  status: string;
+  expiresAt: string;
+};
+
+type Credential = {
+  credentialId: string;
+  vlinkId: string;
+  token: string;
+  issuedAt: string;
+  expiresAt: string;
+};
+
+async function createVLink(sourceType = "ai-client"): Promise<CreatedVLink> {
   const response = await fetch(`${base}/api/v1/vlinks`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workspaceId: "ws-test", environment: "development", displayName: "Test Link", sourceType: "ai-client" }),
+    body: JSON.stringify({
+      workspaceId: "ws-test",
+      environment: "development",
+      displayName: `Test Link ${Date.now()}`,
+      sourceType,
+    }),
   });
   assert.equal(response.status, 201);
-  return (await response.json()).vlink as { vlinkId: string };
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  return (await response.json()) as CreatedVLink;
 }
+
+async function createPairing(created: CreatedVLink): Promise<Pairing> {
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${created.enrollmentGrant.token}`,
+    },
+    body: JSON.stringify({ ttlSeconds: 600 }),
+  });
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  return ((await response.json()) as { pairing: Pairing }).pairing;
+}
+
+async function approveAndExchange(created: CreatedVLink): Promise<{ pairing: Pairing; credential: Credential }> {
+  const pairing = await createPairing(created);
+  const approve = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ approvalCode: pairing.approvalCode }),
+  });
+  assert.equal(approve.status, 200);
+
+  const exchange = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceCode: pairing.deviceCode }),
+  });
+  assert.equal(exchange.status, 200);
+  assert.equal(exchange.headers.get("cache-control"), "no-store");
+  const body = (await exchange.json()) as { credential: Credential };
+  return { pairing, credential: body.credential };
+}
+
+const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
 
 test("browser routes fall through to the UI layer while API misses stay fail-closed", async () => {
   const root = await fetch(`${base}/`);
@@ -41,166 +130,381 @@ test("browser routes fall through to the UI layer while API misses stay fail-clo
 
   const missingApi = await fetch(`${base}/api/not-a-real-route`);
   assert.equal(missingApi.status, 404);
-  assert.equal((await missingApi.json()).error, "not_found");
+  assert.equal(((await missingApi.json()) as { error: string }).error, "not_found");
 });
 
-test("VLink creation and retrieval", async () => {
+
+test("VLink creation returns a short-lived enrollment grant but does not put it on the VLink record", async () => {
   const created = await createVLink();
-  const response = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}`);
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.vlink.vlinkId, created.vlinkId);
-  assert.equal(body.vlink.mode, "observe");
+  assert.match(created.vlink.vlinkId, /^vlk_[a-f0-9]{16}$/);
+  assert.match(created.enrollmentGrant.token, /^vle_[a-f0-9]{16}\.[A-Za-z0-9_-]+$/);
+  assert.equal(created.enrollmentGrant.vlinkId, created.vlink.vlinkId);
+  assert.equal(created.vlink.mode, "observe");
+  assert.equal(JSON.stringify(created.vlink).includes(created.enrollmentGrant.token), false);
 });
 
-test("manifest contains no reusable secrets", async () => {
-  const created = await createVLink();
-  const response = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/manifest`);
-  const text = await response.text();
-  assert.equal(response.status, 200);
-  for (const forbidden of ["api_key", "apikey", "bearer ", "oneTimeCode", "privateKey", "secret"]) {
-    assert.equal(text.toLowerCase().includes(forbidden.toLowerCase()), false, forbidden);
+
+test("production-style configuration refuses unauthenticated VLink creation", async () => {
+  const isolated = createApp({ allowUnauthenticatedCreate: false });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    const response = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "ws", environment: "production", displayName: "blocked", sourceType: "ai-client" }),
+    });
+    assert.equal(response.status, 403);
+    assert.equal(((await response.json()) as { error: string }).error, "workspace_auth_required");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
   }
 });
 
-test("VLink manifest exposes a self-binding OpenAI-compatible base URL", async () => {
+
+test("manifest is self-binding and contains no enrollment, pairing, or access secrets", async () => {
   const created = await createVLink();
-  const response = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/manifest`);
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/manifest`);
   assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.endpoints.openaiCompatibleBaseUrl, `https://connect.example.test/vlinks/${created.vlinkId}/v1`);
+  const text = await response.text();
+  for (const forbidden of ["vle_", "vlt_", "approvalcode", "devicecode", created.enrollmentGrant.token.toLowerCase()]) {
+    assert.equal(text.toLowerCase().includes(forbidden), false, forbidden);
+  }
+  const body = JSON.parse(text);
+  assert.equal(body.endpoints.openaiCompatibleBaseUrl, `https://connect.example.test/vlinks/${created.vlink.vlinkId}/v1`);
+  assert.equal(body.access.scheme, "bearer");
+  assert.equal(body.access.temporaryCredentials, true);
+  assert.equal(body.access.tokenPublishedInManifest, false);
 });
 
-test("endpoint-swap route binds activity without a custom VLink header", async () => {
+
+test("pairing creation requires the enrollment grant", async () => {
   const created = await createVLink();
-  const response = await fetch(`${base}/vlinks/${created.vlinkId}/v1/chat/completions`, {
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "hello through the VLink URL" }] }),
+    body: "{}",
   });
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.metadata.vlinkId, created.vlinkId);
-  const events = registry.activity(created.vlinkId);
-  assert.equal(events[0].route, "/vlinks/:vlinkId/v1/chat/completions");
-  assert.equal(events[0].metadata.binding, "connection-url");
+  assert.equal(response.status, 401);
+  assert.equal(((await response.json()) as { error: string }).error, "enrollment_grant_required");
 });
 
-test("endpoint-swap route rejects a conflicting VLink header", async () => {
+
+test("an enrollment grant is bound to one VLink", async () => {
   const first = await createVLink();
   const second = await createVLink();
-  const response = await fetch(`${base}/vlinks/${first.vlinkId}/v1/chat/completions`, {
+  const response = await fetch(`${base}/api/v1/vlinks/${second.vlink.vlinkId}/pairing`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-vlink-id": second.vlinkId },
-    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "conflict" }] }),
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${first.enrollmentGrant.token}`,
+    },
+    body: "{}",
   });
-  assert.equal(response.status, 400);
-  assert.equal((await response.json()).error, "vlink_binding_conflict");
+  assert.equal(response.status, 401);
+  assert.equal(((await response.json()) as { error: string }).error, "invalid_or_expired_enrollment_grant");
 });
 
-test("endpoint-swap route rejects unknown VLink IDs", async () => {
-  const response = await fetch(`${base}/vlinks/vlk_unknown/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "unknown" }] }),
-  });
-  assert.equal(response.status, 404);
-  assert.equal((await response.json()).error, "invalid_vlink_id");
-});
 
-test("pairing QR payload is a browser approval URL with a fragment-only one-time code", () => {
-  const record = registry.create({ workspaceId: "ws", environment: "dev", displayName: "Pair", sourceType: "local-project" }, "https://connect.example.test");
+test("pairing QR exposes only browser approval while device exchange code stays off the QR", () => {
+  const record = registry.create(
+    { workspaceId: "ws", environment: "dev", displayName: "Pair", sourceType: "local-project" },
+    "https://connect.example.test",
+  );
   const pairing = registry.createPairing(record.vlinkId, "https://connect.example.test", 600)!;
   assert.equal(pairing.pairingUrl, `https://connect.example.test/pair/${record.vlinkId}/${pairing.pairingId}`);
-  assert.ok(pairing.qrPayload.startsWith(`${pairing.pairingUrl}#code=`));
-  assert.equal(pairing.pairingUrl.includes(pairing.oneTimeCode), false);
-  assert.equal(pairing.qrPayload.toLowerCase().includes("api_key"), false);
+  assert.ok(pairing.qrPayload.startsWith(`${pairing.pairingUrl}#approval=`));
+  assert.equal(pairing.pairingUrl.includes(pairing.approvalCode), false);
+  assert.equal(pairing.pairingUrl.includes(pairing.deviceCode), false);
+  assert.equal(pairing.qrPayload.includes(pairing.deviceCode), false);
 });
 
-test("pairing completion is one-time and public status never exposes the code", async () => {
+
+test("public pairing status exposes neither approval code, device code, nor QR payload", async () => {
   const created = await createVLink();
-  const createResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ttlSeconds: 600 }),
-  });
-  assert.equal(createResponse.status, 201);
-  const createdPairing = (await createResponse.json()).pairing;
-
-  const statusResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing/${createdPairing.pairingId}`);
-  const statusText = await statusResponse.text();
-  assert.equal(statusResponse.status, 200);
-  assert.equal(statusText.includes(createdPairing.oneTimeCode), false);
-  assert.equal(statusText.includes("qrPayload"), false);
-
-  const complete = () => fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing/${createdPairing.pairingId}/complete`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ oneTimeCode: createdPairing.oneTimeCode }),
-  });
-  assert.equal((await complete()).status, 200);
-  assert.equal((await complete()).status, 400);
+  const pairing = await createPairing(created);
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}`);
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(text.includes(pairing.approvalCode), false);
+  assert.equal(text.includes(pairing.deviceCode), false);
+  assert.equal(text.includes("qrPayload"), false);
 });
 
-test("expired pairing cannot complete", () => {
-  const record = registry.create({ workspaceId: "ws", environment: "dev", displayName: "Expired", sourceType: "local-project" }, "https://connect.example.test");
-  const started = new Date("2026-08-30T20:00:00Z");
-  const pairing = registry.createPairing(record.vlinkId, "https://connect.example.test", 1, started)!;
-  const result = registry.completePairing(record.vlinkId, pairing.pairingId, pairing.oneTimeCode, new Date("2026-08-30T20:00:02Z"));
-  assert.equal(result, undefined);
-  assert.equal(registry.getPairing(record.vlinkId, pairing.pairingId, new Date("2026-08-30T20:00:02Z"))?.status, "expired");
+
+test("device exchange is impossible before browser approval", async () => {
+  const created = await createVLink();
+  const pairing = await createPairing(created);
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceCode: pairing.deviceCode }),
+  });
+  assert.equal(response.status, 409);
+  assert.equal(((await response.json()) as { error: string }).error, "pairing_not_approved");
 });
 
-test("invalid VLink ID cannot attach to OpenAI activity", async () => {
-  const response = await fetch(`${base}/v1/chat/completions`, {
+
+test("browser approval is one-time and does not itself mint a workload credential", async () => {
+  const created = await createVLink();
+  const pairing = await createPairing(created);
+  const approve = () => fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-vlink-id": "vlk_does_not_exist" },
-    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "hello" }] }),
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ approvalCode: pairing.approvalCode }),
+  });
+  const first = await approve();
+  assert.equal(first.status, 200);
+  const firstText = await first.text();
+  assert.equal(firstText.includes("vlt_"), false);
+  assert.equal((await approve()).status, 400);
+});
+
+
+test("wrong device code cannot exchange an approved pairing", async () => {
+  const created = await createVLink();
+  const pairing = await createPairing(created);
+  await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ approvalCode: pairing.approvalCode }),
+  });
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceCode: "wrong-device-code" }),
   });
   assert.equal(response.status, 400);
-  assert.equal((await response.json()).error, "invalid_vlink_id");
+  assert.equal(((await response.json()) as { error: string }).error, "invalid_device_code");
 });
 
-test("test action creates a VLink-bound activity event", async () => {
+
+test("approved pairing exchanges exactly once for an opaque temporary VLink access token", async () => {
   const created = await createVLink();
-  const testResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/test`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  const pairing = await createPairing(created);
+  await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ approvalCode: pairing.approvalCode }),
+  });
+  const exchange = () => fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceCode: pairing.deviceCode }),
+  });
+  const first = await exchange();
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  const body = (await first.json()) as { credential: Credential; pairing: { status: string } };
+  assert.match(body.credential.token, /^vlt_[a-f0-9]{16}\.[A-Za-z0-9_-]+$/);
+  assert.equal(body.credential.vlinkId, created.vlink.vlinkId);
+  assert.equal(body.pairing.status, "exchanged");
+  assert.equal((await exchange()).status, 400);
+});
+
+
+test("VLink-specific OpenAI route requires a valid temporary access token", async () => {
+  const created = await createVLink();
+  const missing = await fetch(`${base}/vlinks/${created.vlink.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "no token" }] }),
+  });
+  assert.equal(missing.status, 401);
+  assert.equal(((await missing.json()) as { error: string }).error, "vlink_access_token_required");
+
+  const { credential } = await approveAndExchange(created);
+  const allowed = await fetch(`${base}/vlinks/${created.vlink.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(credential.token) },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "authenticated" }] }),
+  });
+  assert.equal(allowed.status, 200);
+  const body = (await allowed.json()) as { metadata: { vlinkId: string; credentialId: string; executionMode: string } };
+  assert.equal(body.metadata.vlinkId, created.vlink.vlinkId);
+  assert.equal(body.metadata.credentialId, credential.credentialId);
+  assert.equal(body.metadata.executionMode, "demo");
+});
+
+
+test("a VLink access token cannot be replayed against another VLink", async () => {
+  const first = await createVLink();
+  const second = await createVLink();
+  const { credential } = await approveAndExchange(first);
+  const response = await fetch(`${base}/vlinks/${second.vlink.vlinkId}/v1/models`, {
+    headers: bearer(credential.token),
+  });
+  assert.equal(response.status, 401);
+  assert.equal(((await response.json()) as { error: string }).error, "invalid_or_expired_vlink_access_token");
+});
+
+
+test("revoked access token loses authority immediately", async () => {
+  const created = await createVLink();
+  const { credential } = await approveAndExchange(created);
+  const revoke = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/access/revoke`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(credential.token) },
+    body: "{}",
+  });
+  assert.equal(revoke.status, 200);
+  const revoked = (await revoke.json()) as { revoked: { status: string } };
+  assert.equal(revoked.revoked.status, "revoked");
+
+  const afterRevoke = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/access-test`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(credential.token) },
+    body: "{}",
+  });
+  assert.equal(afterRevoke.status, 401);
+});
+
+
+test("expired enrollment grants and expired workload tokens fail closed", () => {
+  const local = new InMemoryVLinkRegistry();
+  const started = new Date("2026-08-30T20:00:00Z");
+  const vlink = local.create({ workspaceId: "ws", environment: "dev", displayName: "TTL", sourceType: "ai-client" }, "https://connect.example.test");
+  const grant = local.issueEnrollmentGrant(vlink.vlinkId, 1, started)!;
+  assert.equal(local.authenticateEnrollment(vlink.vlinkId, grant.token, new Date("2026-08-30T20:00:02Z")), undefined);
+
+  const pairing = local.createPairing(vlink.vlinkId, "https://connect.example.test", 30, started)!;
+  local.approvePairing(vlink.vlinkId, pairing.pairingId, pairing.approvalCode, started);
+  const credential = local.exchangePairing(vlink.vlinkId, pairing.pairingId, pairing.deviceCode, 1, started)!;
+  assert.equal(local.authenticate(vlink.vlinkId, credential.token, new Date("2026-08-30T20:00:02Z")), undefined);
+});
+
+
+test("expired pairing cannot be approved or exchanged", () => {
+  const local = new InMemoryVLinkRegistry();
+  const started = new Date("2026-08-30T20:00:00Z");
+  const vlink = local.create({ workspaceId: "ws", environment: "dev", displayName: "Expired", sourceType: "local-project" }, "https://connect.example.test");
+  const pairing = local.createPairing(vlink.vlinkId, "https://connect.example.test", 1, started)!;
+  const later = new Date("2026-08-30T20:00:02Z");
+  assert.equal(local.approvePairing(vlink.vlinkId, pairing.pairingId, pairing.approvalCode, later), undefined);
+  assert.equal(local.getPairingStatus(vlink.vlinkId, pairing.pairingId, later)?.status, "expired");
+  assert.equal(local.exchangePairing(vlink.vlinkId, pairing.pairingId, pairing.deviceCode, 60, later), undefined);
+});
+
+
+test("endpoint URL identity conflict and unknown IDs are rejected before execution", async () => {
+  const first = await createVLink();
+  const second = await createVLink();
+  const conflict = await fetch(`${base}/vlinks/${first.vlink.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-vlink-id": second.vlink.vlinkId },
+    body: "{}",
+  });
+  assert.equal(conflict.status, 400);
+  assert.equal(((await conflict.json()) as { error: string }).error, "vlink_binding_conflict");
+
+  const unknown = await fetch(`${base}/vlinks/vlk_unknown/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(unknown.status, 404);
+  assert.equal(((await unknown.json()) as { error: string }).error, "invalid_vlink_id");
+});
+
+
+test("unbound global OpenAI compatibility is disabled by default", async () => {
+  const response = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "demo", messages: [] }),
+  });
+  assert.equal(response.status, 400);
+  assert.equal(((await response.json()) as { error: string }).error, "vlink_required");
+});
+
+
+test("global OpenAI compatibility still works with an explicit VLink binding plus access token", async () => {
+  const created = await createVLink();
+  const { credential } = await approveAndExchange(created);
+  const response = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-vlink-id": created.vlink.vlinkId,
+      ...bearer(credential.token),
+    },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "compatibility" }] }),
+  });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { metadata: { executionMode: string; credentialId: string } };
+  assert.equal(body.metadata.executionMode, "demo");
+  assert.equal(body.metadata.credentialId, credential.credentialId);
+});
+
+
+test("authenticated connection test and activity never serialize the bearer token", async () => {
+  const created = await createVLink();
+  const { credential } = await approveAndExchange(created);
+  const testResponse = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/test`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(credential.token) },
+    body: "{}",
+  });
   assert.equal(testResponse.status, 200);
-  const activityResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/activity`);
-  const body = await activityResponse.json();
-  assert.equal(body.events.length, 1);
-  assert.equal(body.events[0].vlinkId, created.vlinkId);
+
+  const activityResponse = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/activity`, {
+    headers: bearer(credential.token),
+  });
+  const text = await activityResponse.text();
+  assert.equal(activityResponse.status, 200);
+  assert.equal(text.includes(credential.token), false);
+  const body = JSON.parse(text);
+  assert.equal(body.events[0].metadata.credentialId, credential.credentialId);
   assert.equal(body.events[0].metadata.cryptographicReceipt, false);
 });
 
-test("OpenAI-compatible demo route still works and is explicitly labeled demo", async () => {
-  const created = await createVLink();
-  const response = await fetch(`${base}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-vlink-id": created.vlinkId },
-    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "hello" }] }),
-  });
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.object, "chat.completion");
-  assert.equal(body.metadata.executionMode, "demo");
-  const events = registry.activity(created.vlinkId);
-  assert.equal(events[0].route, "/v1/chat/completions");
-});
 
-test("existing webhook route works and validates optional VLink binding", async () => {
-  const created = await createVLink();
-  const ok = await fetch(`${base}/api/v1/webhooks/zapier-test`, {
+test("webhook ingress requires VLink access and records metadata without storing the request body", async () => {
+  const created = await createVLink("webhook");
+  const missing = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/webhook`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-vlink-id": created.vlinkId },
-    body: JSON.stringify({ hello: "world" }),
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ secretPayload: "do-not-store" }),
+  });
+  assert.equal(missing.status, 401);
+
+  const { credential } = await approveAndExchange(created);
+  const ok = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/webhook`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(credential.token) },
+    body: JSON.stringify({ secretPayload: "do-not-store" }),
   });
   assert.equal(ok.status, 202);
-  assert.equal((await ok.json()).vlinkId, created.vlinkId);
+  const events = registry.activity(created.vlink.vlinkId);
+  assert.equal(events[0].metadata.bodyStored, false);
+  assert.equal(JSON.stringify(events[0]).includes("do-not-store"), false);
+  assert.equal(JSON.stringify(events[0]).includes(credential.token), false);
+});
 
-  const bad = await fetch(`${base}/api/v1/webhooks/zapier-test`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-vlink-id": "vlk_invalid" },
-    body: "{}",
-  });
-  assert.equal(bad.status, 400);
+
+test("VLink bearer token is never forwarded to an allowlisted custom target", async () => {
+  const created = await createVLink();
+  const { credential } = await approveAndExchange(created);
+  const previous = process.env.VLINK_ALLOWED_TARGET_HOSTS;
+  process.env.VLINK_ALLOWED_TARGET_HOSTS = "127.0.0.1";
+  targetAuthorization = undefined;
+  try {
+    const response = await fetch(`${base}/vlinks/${created.vlink.vlinkId}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-target-url": `${targetBase}/chat`,
+        ...bearer(credential.token),
+      },
+      body: JSON.stringify({ model: "custom", messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(targetAuthorization, undefined);
+    const events = registry.activity(created.vlink.vlinkId);
+    assert.equal(events[0].metadata.vlinkAccessTokenForwardedUpstream, false);
+  } finally {
+    if (previous === undefined) delete process.env.VLINK_ALLOWED_TARGET_HOSTS;
+    else process.env.VLINK_ALLOWED_TARGET_HOSTS = previous;
+  }
 });
