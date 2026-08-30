@@ -1,8 +1,11 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type {
+  VLinkAccessCredential,
+  VLinkAccessCredentialSummary,
   VLinkActivityEvent,
   VLinkManifest,
   VLinkPairingRequest,
+  VLinkPairingStatusView,
   VLinkRecord,
   VLinkSourceType,
 } from "../types/vlink";
@@ -16,24 +19,48 @@ export interface CreateVLinkInput {
   expiresAt?: string;
 }
 
+interface StoredPairing extends VLinkPairingStatusView {
+  approvalCodeHash: string;
+  deviceCodeHash: string;
+}
+
+interface StoredCredential {
+  credentialId: string;
+  vlinkId: string;
+  tokenHash: string;
+  issuedAt: string;
+  expiresAt: string;
+  revokedAt?: string;
+}
+
 export interface VLinkRegistry {
   create(input: CreateVLinkInput, origin: string): VLinkRecord;
   list(): VLinkRecord[];
   get(vlinkId: string): VLinkRecord | undefined;
   manifest(vlinkId: string): VLinkManifest | undefined;
   createPairing(vlinkId: string, origin: string, ttlSeconds?: number, now?: Date): VLinkPairingRequest | undefined;
-  getPairing(vlinkId: string, pairingId: string, now?: Date): VLinkPairingRequest | undefined;
-  completePairing(vlinkId: string, pairingId: string, oneTimeCode: string, now?: Date): VLinkPairingRequest | undefined;
+  getPairingStatus(vlinkId: string, pairingId: string, now?: Date): VLinkPairingStatusView | undefined;
+  approvePairing(vlinkId: string, pairingId: string, approvalCode: string, now?: Date): VLinkPairingStatusView | undefined;
+  exchangePairing(vlinkId: string, pairingId: string, deviceCode: string, credentialTtlSeconds?: number, now?: Date): VLinkAccessCredential | undefined;
+  authenticate(vlinkId: string, token: string, now?: Date): VLinkAccessCredentialSummary | undefined;
+  revokeCredential(vlinkId: string, credentialId: string, now?: Date): VLinkAccessCredentialSummary | undefined;
   addActivity(event: Omit<VLinkActivityEvent, "eventId" | "timestamp">, now?: Date): VLinkActivityEvent;
   activity(vlinkId: string): VLinkActivityEvent[];
   clear(): void;
 }
 
 const cleanOrigin = (origin: string) => origin.replace(/\/$/, "");
+const hashSecret = (secret: string) => createHash("sha256").update(secret, "utf8").digest("hex");
+const secureHashMatch = (expectedHash: string, providedSecret: string) => {
+  const expected = Buffer.from(expectedHash, "hex");
+  const actual = Buffer.from(hashSecret(providedSecret), "hex");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+};
 
 export class InMemoryVLinkRegistry implements VLinkRegistry {
   private readonly vlinks = new Map<string, VLinkRecord>();
-  private readonly pairings = new Map<string, VLinkPairingRequest>();
+  private readonly pairings = new Map<string, StoredPairing>();
+  private readonly credentials = new Map<string, StoredCredential>();
   private readonly activities = new Map<string, VLinkActivityEvent[]>();
 
   create(input: CreateVLinkInput, origin: string): VLinkRecord {
@@ -93,6 +120,11 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
         status: vlink.enrollmentStatus,
         pairingRequired: vlink.enrollmentStatus !== "paired",
       },
+      access: {
+        scheme: "bearer",
+        temporaryCredentials: true,
+        tokenPublishedInManifest: false,
+      },
       generatedAt: new Date().toISOString(),
     };
   }
@@ -100,46 +132,100 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   createPairing(vlinkId: string, origin: string, ttlSeconds = 600, now = new Date()): VLinkPairingRequest | undefined {
     const vlink = this.vlinks.get(vlinkId);
     if (!vlink) return undefined;
+
     const pairingId = `pair_${randomBytes(8).toString("hex")}`;
-    const oneTimeCode = randomBytes(18).toString("base64url");
+    const approvalCode = randomBytes(24).toString("base64url");
+    const deviceCode = randomBytes(32).toString("base64url");
     const expiresAt = new Date(now.getTime() + Math.max(1, ttlSeconds) * 1000).toISOString();
     const root = cleanOrigin(origin);
     const pairingUrl = `${root}/pair/${vlinkId}/${pairingId}`;
-    const request: VLinkPairingRequest = {
+
+    const stored: StoredPairing = {
       pairingId,
       vlinkId,
-      oneTimeCode,
       pairingUrl,
-      qrPayload: `${pairingUrl}#code=${encodeURIComponent(oneTimeCode)}`,
       status: "pending",
       createdAt: now.toISOString(),
       expiresAt,
+      approvalCodeHash: hashSecret(approvalCode),
+      deviceCodeHash: hashSecret(deviceCode),
     };
-    this.pairings.set(pairingId, request);
+    this.pairings.set(pairingId, stored);
     vlink.enrollmentStatus = "pending";
     vlink.updatedAt = now.toISOString();
-    return structuredClone(request);
+
+    return {
+      pairingId,
+      vlinkId,
+      approvalCode,
+      deviceCode,
+      pairingUrl,
+      qrPayload: `${pairingUrl}#approval=${encodeURIComponent(approvalCode)}`,
+      status: "pending",
+      createdAt: stored.createdAt,
+      expiresAt,
+    };
   }
 
-  getPairing(vlinkId: string, pairingId: string, now = new Date()): VLinkPairingRequest | undefined {
+  getPairingStatus(vlinkId: string, pairingId: string, now = new Date()): VLinkPairingStatusView | undefined {
     const pairing = this.pairings.get(pairingId);
     if (!pairing || pairing.vlinkId !== vlinkId) return undefined;
     this.expirePairingIfNeeded(pairing, now);
-    return structuredClone(pairing);
+    return this.publicPairing(pairing);
   }
 
-  completePairing(vlinkId: string, pairingId: string, oneTimeCode: string, now = new Date()): VLinkPairingRequest | undefined {
+  approvePairing(vlinkId: string, pairingId: string, approvalCode: string, now = new Date()): VLinkPairingStatusView | undefined {
     const pairing = this.pairings.get(pairingId);
     const vlink = this.vlinks.get(vlinkId);
     if (!pairing || !vlink || pairing.vlinkId !== vlinkId) return undefined;
     this.expirePairingIfNeeded(pairing, now);
-    if (pairing.status !== "pending" || pairing.oneTimeCode !== oneTimeCode) return undefined;
-    pairing.status = "completed";
-    pairing.completedAt = now.toISOString();
+    if (pairing.status !== "pending" || !secureHashMatch(pairing.approvalCodeHash, approvalCode)) return undefined;
+
+    pairing.status = "approved";
+    pairing.approvedAt = now.toISOString();
+    vlink.enrollmentStatus = "approved";
+    vlink.updatedAt = now.toISOString();
+    return this.publicPairing(pairing);
+  }
+
+  exchangePairing(
+    vlinkId: string,
+    pairingId: string,
+    deviceCode: string,
+    credentialTtlSeconds = 3600,
+    now = new Date(),
+  ): VLinkAccessCredential | undefined {
+    const pairing = this.pairings.get(pairingId);
+    const vlink = this.vlinks.get(vlinkId);
+    if (!pairing || !vlink || pairing.vlinkId !== vlinkId) return undefined;
+    this.expirePairingIfNeeded(pairing, now);
+    if (pairing.status !== "approved" || !secureHashMatch(pairing.deviceCodeHash, deviceCode)) return undefined;
+
+    const credential = this.issueCredential(vlinkId, Math.max(1, credentialTtlSeconds), now);
+    pairing.status = "exchanged";
+    pairing.exchangedAt = now.toISOString();
     vlink.enrollmentStatus = "paired";
     vlink.connectionStatus = "paired";
     vlink.updatedAt = now.toISOString();
-    return structuredClone(pairing);
+    return credential;
+  }
+
+  authenticate(vlinkId: string, token: string, now = new Date()): VLinkAccessCredentialSummary | undefined {
+    const match = /^vlt_([a-f0-9]{16})\.([A-Za-z0-9_-]+)$/.exec(token);
+    if (!match) return undefined;
+    const credentialId = `cred_${match[1]}`;
+    const credential = this.credentials.get(credentialId);
+    if (!credential || credential.vlinkId !== vlinkId || credential.revokedAt) return undefined;
+    if (new Date(credential.expiresAt).getTime() <= now.getTime()) return undefined;
+    if (!secureHashMatch(credential.tokenHash, token)) return undefined;
+    return this.credentialSummary(credential, now);
+  }
+
+  revokeCredential(vlinkId: string, credentialId: string, now = new Date()): VLinkAccessCredentialSummary | undefined {
+    const credential = this.credentials.get(credentialId);
+    if (!credential || credential.vlinkId !== vlinkId) return undefined;
+    if (!credential.revokedAt) credential.revokedAt = now.toISOString();
+    return this.credentialSummary(credential, now);
   }
 
   addActivity(event: Omit<VLinkActivityEvent, "eventId" | "timestamp">, now = new Date()): VLinkActivityEvent {
@@ -167,11 +253,58 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   clear(): void {
     this.vlinks.clear();
     this.pairings.clear();
+    this.credentials.clear();
     this.activities.clear();
   }
 
-  private expirePairingIfNeeded(pairing: VLinkPairingRequest, now: Date): void {
-    if (pairing.status === "pending" && new Date(pairing.expiresAt).getTime() <= now.getTime()) {
+  private issueCredential(vlinkId: string, ttlSeconds: number, now: Date): VLinkAccessCredential {
+    const id = randomBytes(8).toString("hex");
+    const credentialId = `cred_${id}`;
+    const secret = randomBytes(32).toString("base64url");
+    const token = `vlt_${id}.${secret}`;
+    const issuedAt = now.toISOString();
+    const expiresAt = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
+    this.credentials.set(credentialId, {
+      credentialId,
+      vlinkId,
+      tokenHash: hashSecret(token),
+      issuedAt,
+      expiresAt,
+    });
+    return { credentialId, vlinkId, token, issuedAt, expiresAt };
+  }
+
+  private publicPairing(pairing: StoredPairing): VLinkPairingStatusView {
+    return {
+      pairingId: pairing.pairingId,
+      vlinkId: pairing.vlinkId,
+      pairingUrl: pairing.pairingUrl,
+      status: pairing.status,
+      createdAt: pairing.createdAt,
+      expiresAt: pairing.expiresAt,
+      ...(pairing.approvedAt ? { approvedAt: pairing.approvedAt } : {}),
+      ...(pairing.exchangedAt ? { exchangedAt: pairing.exchangedAt } : {}),
+    };
+  }
+
+  private credentialSummary(credential: StoredCredential, now: Date): VLinkAccessCredentialSummary {
+    const status = credential.revokedAt
+      ? "revoked"
+      : new Date(credential.expiresAt).getTime() <= now.getTime()
+        ? "expired"
+        : "active";
+    return {
+      credentialId: credential.credentialId,
+      vlinkId: credential.vlinkId,
+      issuedAt: credential.issuedAt,
+      expiresAt: credential.expiresAt,
+      status,
+      ...(credential.revokedAt ? { revokedAt: credential.revokedAt } : {}),
+    };
+  }
+
+  private expirePairingIfNeeded(pairing: StoredPairing, now: Date): void {
+    if ((pairing.status === "pending" || pairing.status === "approved") && new Date(pairing.expiresAt).getTime() <= now.getTime()) {
       pairing.status = "expired";
       const vlink = this.vlinks.get(pairing.vlinkId);
       if (vlink) {
