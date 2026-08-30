@@ -14,12 +14,13 @@ The first release follows one product flow:
 - In-memory registry behind an interface that can be replaced by persistent storage later.
 - VLink create/list/read endpoints.
 - Non-secret machine-readable manifests at `/.well-known/vlink.json` and `/api/v1/vlinks/:vlinkId/manifest`.
+- A self-binding OpenAI-compatible base URL for every VLink: `/vlinks/<vlink-id>/v1`. Normal compatible clients can change one base URL without adding a custom VLink header.
 - Short-lived, one-time pairing requests. QR payloads contain an expiring enrollment code, never a reusable API key.
 - A real internal connection-test route that creates a VLink-bound activity event.
 - VLink activity timeline endpoint.
 - Dedicated VLink webhook ingress plus compatibility with the prototype webhook route.
-- Optional `X-VLink-Id` binding on OpenAI-compatible and webhook traffic, with existence validation.
-- OpenAI-compatible `/v1/models` and `/v1/chat/completions` routes.
+- Optional legacy `X-VLink-Id` binding on the global OpenAI-compatible and webhook routes, with existence validation.
+- OpenAI-compatible model and chat-completion routes.
 - Live Gemini execution when `GEMINI_API_KEY` and a model are configured.
 - Explicit demo responses only when `VLINK_ENABLE_DEMO_RESPONSES=true`.
 - Custom HTTP target forwarding only to hosts explicitly listed in `VLINK_ALLOWED_TARGET_HOSTS`.
@@ -32,6 +33,7 @@ VLink does **not** currently claim any of the following:
 - Cryptographically signed or independently verifiable receipts.
 - Durable database persistence.
 - Production SPIFFE/SPIRE workload identity issuance or verification.
+- Production authentication/authorization for VLink management or execution traffic.
 - Hardware attestation or enclave verification.
 - Formal non-repudiation.
 - Verified multi-cloud failover or zero-downtime switching.
@@ -84,13 +86,29 @@ curl -X POST http://localhost:3000/api/v1/vlinks \
   }'
 ```
 
-Read its manifest:
+The returned VLink contains a base URL like:
+
+```text
+http://localhost:3000/vlinks/vlk_abc123/v1
+```
+
+Use that as the client's OpenAI-compatible base URL. The connection URL itself binds traffic to the VLink, so no `X-VLink-Id` header is required:
+
+```bash
+curl -X POST http://localhost:3000/vlinks/<vlink-id>/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"your-model","messages":[{"role":"user","content":"hello"}]}'
+```
+
+The global `/v1` compatibility route remains available and can still be explicitly bound with `X-VLink-Id` for clients that need that pattern.
+
+Read the machine-readable manifest:
 
 ```bash
 curl http://localhost:3000/api/v1/vlinks/<vlink-id>/manifest
 ```
 
-Run the connection test:
+Run the internal connection test:
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/vlinks/<vlink-id>/test \
@@ -103,25 +121,18 @@ Read activity:
 curl http://localhost:3000/api/v1/vlinks/<vlink-id>/activity
 ```
 
-Bind an OpenAI-compatible request to the VLink:
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'X-VLink-Id: <vlink-id>' \
-  -d '{"model":"your-model","messages":[{"role":"user","content":"hello"}]}'
-```
-
-Without a configured live provider, this returns `503` unless demo responses were deliberately enabled.
+Without a configured live provider, model execution returns `503` unless demo responses were deliberately enabled.
 
 ## Security posture of this release
 
+- **A VLink ID is a connection identifier, not authentication or authority.** Putting it in the URL makes connection binding frictionless; it does not make possession of the URL sufficient authorization for a production deployment.
 - Manifests contain connection metadata only; pairing secrets are not published in manifests.
 - Pairing codes are short-lived and one-time use.
 - Unknown user-supplied VLink IDs are rejected before events are recorded.
+- A VLink-specific URL rejects a contradictory `X-VLink-Id`/query binding rather than silently reassigning the activity.
 - Webhook request bodies are accepted by the ingress route but are **not persisted** by the in-memory activity store; activity records store metadata such as payload size.
 - Arbitrary SSRF-style `X-Target-Url` forwarding is disabled by default and requires a hostname allowlist.
-- Registry, pairing, and activity state are lost when the process restarts. Production deployment requires persistent storage and an authentication/authorization layer before exposing management routes publicly.
+- Registry, pairing, and activity state are lost when the process restarts. Production deployment requires persistent storage and an authentication/authorization layer before exposing management or execution routes publicly.
 
 ## Architecture boundary
 
@@ -130,6 +141,7 @@ Veklom Capability OS
         │
         └── VLink
               ├── portable connection object
+              ├── self-binding connection URL
               ├── non-secret discovery manifest
               ├── short-lived enrollment / pairing
               ├── OpenAI-compatible ingress
