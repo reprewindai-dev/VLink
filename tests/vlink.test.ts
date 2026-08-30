@@ -48,6 +48,51 @@ test("manifest contains no reusable secrets", async () => {
   }
 });
 
+test("VLink manifest exposes a self-binding OpenAI-compatible base URL", async () => {
+  const created = await createVLink();
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/manifest`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.endpoints.openaiCompatibleBaseUrl, `https://connect.example.test/vlinks/${created.vlinkId}/v1`);
+});
+
+test("endpoint-swap route binds activity without a custom VLink header", async () => {
+  const created = await createVLink();
+  const response = await fetch(`${base}/vlinks/${created.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "hello through the VLink URL" }] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.metadata.vlinkId, created.vlinkId);
+  const events = registry.activity(created.vlinkId);
+  assert.equal(events[0].route, "/vlinks/:vlinkId/v1/chat/completions");
+  assert.equal(events[0].metadata.binding, "connection-url");
+});
+
+test("endpoint-swap route rejects a conflicting VLink header", async () => {
+  const first = await createVLink();
+  const second = await createVLink();
+  const response = await fetch(`${base}/vlinks/${first.vlinkId}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-vlink-id": second.vlinkId },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "conflict" }] }),
+  });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, "vlink_binding_conflict");
+});
+
+test("endpoint-swap route rejects unknown VLink IDs", async () => {
+  const response = await fetch(`${base}/vlinks/vlk_unknown/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "demo", messages: [{ role: "user", content: "unknown" }] }),
+  });
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).error, "invalid_vlink_id");
+});
+
 test("expired pairing cannot complete", () => {
   const record = registry.create({ workspaceId: "ws", environment: "dev", displayName: "Expired", sourceType: "local-project" }, "https://connect.example.test");
   const started = new Date("2026-08-30T20:00:00Z");
