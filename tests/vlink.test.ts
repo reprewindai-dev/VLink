@@ -93,6 +93,40 @@ test("endpoint-swap route rejects unknown VLink IDs", async () => {
   assert.equal((await response.json()).error, "invalid_vlink_id");
 });
 
+test("pairing QR payload is a browser approval URL with a fragment-only one-time code", () => {
+  const record = registry.create({ workspaceId: "ws", environment: "dev", displayName: "Pair", sourceType: "local-project" }, "https://connect.example.test");
+  const pairing = registry.createPairing(record.vlinkId, "https://connect.example.test", 600)!;
+  assert.equal(pairing.pairingUrl, `https://connect.example.test/pair/${record.vlinkId}/${pairing.pairingId}`);
+  assert.ok(pairing.qrPayload.startsWith(`${pairing.pairingUrl}#code=`));
+  assert.equal(pairing.pairingUrl.includes(pairing.oneTimeCode), false);
+  assert.equal(pairing.qrPayload.toLowerCase().includes("api_key"), false);
+});
+
+test("pairing completion is one-time and public status never exposes the code", async () => {
+  const created = await createVLink();
+  const createResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttlSeconds: 600 }),
+  });
+  assert.equal(createResponse.status, 201);
+  const createdPairing = (await createResponse.json()).pairing;
+
+  const statusResponse = await fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing/${createdPairing.pairingId}`);
+  const statusText = await statusResponse.text();
+  assert.equal(statusResponse.status, 200);
+  assert.equal(statusText.includes(createdPairing.oneTimeCode), false);
+  assert.equal(statusText.includes("qrPayload"), false);
+
+  const complete = () => fetch(`${base}/api/v1/vlinks/${created.vlinkId}/pairing/${createdPairing.pairingId}/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ oneTimeCode: createdPairing.oneTimeCode }),
+  });
+  assert.equal((await complete()).status, 200);
+  assert.equal((await complete()).status, 400);
+});
+
 test("expired pairing cannot complete", () => {
   const record = registry.create({ workspaceId: "ws", environment: "dev", displayName: "Expired", sourceType: "local-project" }, "https://connect.example.test");
   const started = new Date("2026-08-30T20:00:00Z");
