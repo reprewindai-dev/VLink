@@ -104,13 +104,13 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     const oneTimeCode = randomBytes(18).toString("base64url");
     const expiresAt = new Date(now.getTime() + Math.max(1, ttlSeconds) * 1000).toISOString();
     const root = cleanOrigin(origin);
-    const pairingUrl = `${root}/pair/${pairingId}`;
+    const pairingUrl = `${root}/pair/${vlinkId}/${pairingId}`;
     const request: VLinkPairingRequest = {
       pairingId,
       vlinkId,
       oneTimeCode,
       pairingUrl,
-      qrPayload: JSON.stringify({ protocol: "vlink-pair/v1", pairingId, vlinkId, pairingUrl, oneTimeCode, expiresAt }),
+      qrPayload: `${pairingUrl}#code=${encodeURIComponent(oneTimeCode)}`,
       status: "pending",
       createdAt: now.toISOString(),
       expiresAt,
