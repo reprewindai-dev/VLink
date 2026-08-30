@@ -407,7 +407,7 @@ export function createApp(options: CreateAppOptions = {}) {
     res.status(501).json({ status: "planned", protocol: "mcp", message: "VLink publishes an MCP endpoint placeholder; full MCP transport is not implemented in this release." });
   });
 
-  app.use((_req, res) => res.status(404).json({ error: "not_found" }));
+  app.use(["/api", "/v1", "/mcp", "/vlinks"], (_req, res) => res.status(404).json({ error: "not_found" }));
 
   return { app, registry };
 }
