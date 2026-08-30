@@ -3,6 +3,8 @@ import type {
   VLinkAccessCredential,
   VLinkAccessCredentialSummary,
   VLinkActivityEvent,
+  VLinkEnrollmentGrant,
+  VLinkEnrollmentGrantSummary,
   VLinkManifest,
   VLinkPairingRequest,
   VLinkPairingStatusView,
@@ -24,6 +26,14 @@ interface StoredPairing extends VLinkPairingStatusView {
   deviceCodeHash: string;
 }
 
+interface StoredEnrollmentGrant {
+  grantId: string;
+  vlinkId: string;
+  tokenHash: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
 interface StoredCredential {
   credentialId: string;
   vlinkId: string;
@@ -38,6 +48,8 @@ export interface VLinkRegistry {
   list(): VLinkRecord[];
   get(vlinkId: string): VLinkRecord | undefined;
   manifest(vlinkId: string): VLinkManifest | undefined;
+  issueEnrollmentGrant(vlinkId: string, ttlSeconds?: number, now?: Date): VLinkEnrollmentGrant | undefined;
+  authenticateEnrollment(vlinkId: string, token: string, now?: Date): VLinkEnrollmentGrantSummary | undefined;
   createPairing(vlinkId: string, origin: string, ttlSeconds?: number, now?: Date): VLinkPairingRequest | undefined;
   getPairingStatus(vlinkId: string, pairingId: string, now?: Date): VLinkPairingStatusView | undefined;
   approvePairing(vlinkId: string, pairingId: string, approvalCode: string, now?: Date): VLinkPairingStatusView | undefined;
@@ -59,6 +71,7 @@ const secureHashMatch = (expectedHash: string, providedSecret: string) => {
 
 export class InMemoryVLinkRegistry implements VLinkRegistry {
   private readonly vlinks = new Map<string, VLinkRecord>();
+  private readonly enrollmentGrants = new Map<string, StoredEnrollmentGrant>();
   private readonly pairings = new Map<string, StoredPairing>();
   private readonly credentials = new Map<string, StoredCredential>();
   private readonly activities = new Map<string, VLinkActivityEvent[]>();
@@ -126,6 +139,40 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
         tokenPublishedInManifest: false,
       },
       generatedAt: new Date().toISOString(),
+    };
+  }
+
+  issueEnrollmentGrant(vlinkId: string, ttlSeconds = 900, now = new Date()): VLinkEnrollmentGrant | undefined {
+    if (!this.vlinks.has(vlinkId)) return undefined;
+    const id = randomBytes(8).toString("hex");
+    const grantId = `enr_${id}`;
+    const secret = randomBytes(32).toString("base64url");
+    const token = `vle_${id}.${secret}`;
+    const issuedAt = now.toISOString();
+    const expiresAt = new Date(now.getTime() + Math.max(1, ttlSeconds) * 1000).toISOString();
+    this.enrollmentGrants.set(grantId, {
+      grantId,
+      vlinkId,
+      tokenHash: hashSecret(token),
+      issuedAt,
+      expiresAt,
+    });
+    return { grantId, vlinkId, token, issuedAt, expiresAt };
+  }
+
+  authenticateEnrollment(vlinkId: string, token: string, now = new Date()): VLinkEnrollmentGrantSummary | undefined {
+    const match = /^vle_([a-f0-9]{16})\.([A-Za-z0-9_-]+)$/.exec(token);
+    if (!match) return undefined;
+    const grantId = `enr_${match[1]}`;
+    const grant = this.enrollmentGrants.get(grantId);
+    if (!grant || grant.vlinkId !== vlinkId) return undefined;
+    if (new Date(grant.expiresAt).getTime() <= now.getTime()) return undefined;
+    if (!secureHashMatch(grant.tokenHash, token)) return undefined;
+    return {
+      grantId: grant.grantId,
+      vlinkId: grant.vlinkId,
+      issuedAt: grant.issuedAt,
+      expiresAt: grant.expiresAt,
     };
   }
 
@@ -252,6 +299,7 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
 
   clear(): void {
     this.vlinks.clear();
+    this.enrollmentGrants.clear();
     this.pairings.clear();
     this.credentials.clear();
     this.activities.clear();
