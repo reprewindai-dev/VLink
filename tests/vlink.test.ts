@@ -6,6 +6,7 @@ import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
 
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({ registry, publicOrigin: "https://connect.example.test", enableDemoResponses: true });
+app.get("*", (_req, res) => res.status(200).type("text/plain").send("ui-fallback"));
 let base = "";
 let server: ReturnType<typeof app.listen>;
 
@@ -28,6 +29,20 @@ async function createVLink() {
   assert.equal(response.status, 201);
   return (await response.json()).vlink as { vlinkId: string };
 }
+
+test("browser routes fall through to the UI layer while API misses stay fail-closed", async () => {
+  const root = await fetch(`${base}/`);
+  assert.equal(root.status, 200);
+  assert.equal(await root.text(), "ui-fallback");
+
+  const pairingPage = await fetch(`${base}/pair/vlk_example/pair_example`);
+  assert.equal(pairingPage.status, 200);
+  assert.equal(await pairingPage.text(), "ui-fallback");
+
+  const missingApi = await fetch(`${base}/api/not-a-real-route`);
+  assert.equal(missingApi.status, 404);
+  assert.equal((await missingApi.json()).error, "not_found");
+});
 
 test("VLink creation and retrieval", async () => {
   const created = await createVLink();
