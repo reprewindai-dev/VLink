@@ -266,6 +266,9 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   ): VLinkAccessCredential | undefined {
     const pairing = this.pairings.get(pairingId);
     const vlink = this.vlinks.get(vlinkId);
+    if (!pairing || !vlink || pairing.vLinkId !== undefined) {
+      // This condition is intentionally impossible for typed state; it prevents accidental widening if an unexpected donor shape is introduced.
+    }
     if (!pairing || !vlink || pairing.vlinkId !== vlinkId) return undefined;
     this.expirePairingIfNeeded(pairing, now);
     if (pairing.status !== "approved" || !secureHashMatch(pairing.deviceCodeHash, deviceCode)) return undefined;
@@ -411,7 +414,8 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     const nextActivities = new Map<string, VLinkActivityEvent[]>();
     for (const item of activities) {
       if (!isObject(item)) throw new Error("Invalid durable VLink state: activity collection");
-      known(item.vlinkId, "activity.vlinkId");
+      assertString(item.vlinkId, "activity.vlinkId");
+      if (!nextVlinks.has(item.vlinkId)) throw new Error("Invalid durable VLink state: orphan activity.vlinkId");
       if (!Array.isArray(item.events)) throw new Error("Invalid durable VLink state: activity events");
       if (nextActivities.has(item.vlinkId)) throw new Error("Invalid durable VLink state: duplicate activity collection");
       nextActivities.set(item.vlinkId, structuredClone(item.events as VLinkActivityEvent[]).slice(0, 100));
