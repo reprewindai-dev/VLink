@@ -2,31 +2,47 @@
 
 > Link existing tools, models, workflows, and services to Veklom without rewriting application logic.
 
-VLink is a Veklom connection module extracted from the OmniConnect prototype. Its job is deliberately narrow: create a portable, self-describing connection object that a model client, workflow, service, local project, CI job, container, or future MCP client can use to connect to Veklom with low setup friction.
+VLink is the low-friction connection primitive into Veklom. It creates a portable, self-describing connection object that a model client, workflow, service, local project, CI job, container, or future MCP client can use without adopting a large SDK.
 
-The first release follows one product flow:
+The current product flow is:
 
-**Create → Connect → Test → Observe activity → later attach governance.**
+**Create → Pair → Receive temporary access → Connect → Test → Observe activity → later attach governance.**
 
 ## What is implemented now
 
 - Versioned `VLink` TypeScript contract (`vlink/v1`).
-- In-memory registry behind an interface that can be replaced by persistent storage later.
+- In-memory registry behind a replaceable interface.
 - VLink create/list/read endpoints.
-- Non-secret machine-readable manifests at `/.well-known/vlink.json` and `/api/v1/vlinks/:vlinkId/manifest`.
-- A self-binding OpenAI-compatible base URL for every VLink: `/vlinks/<vlink-id>/v1`. Normal compatible clients can change one base URL without adding a custom VLink header.
-- Short-lived, one-time browser pairing requests. QR codes open an approval page and keep the approval code in the URL fragment so it is not sent in the browser request path/query.
-- Pairing status responses strip the one-time code, and successful approval cannot be replayed.
-- A real internal connection-test route that creates a VLink-bound activity event.
-- VLink activity timeline endpoint.
-- Dedicated VLink webhook ingress plus compatibility with the prototype webhook route.
-- Optional legacy `X-VLink-Id` binding on the global OpenAI-compatible and webhook routes, with existence validation.
-- OpenAI-compatible model and chat-completion routes.
+- Secret-free machine-readable manifests at `/.well-known/vlink.json` and `/api/v1/vlinks/:vlinkId/manifest`.
+- A self-binding OpenAI-compatible base URL for every VLink: `/vlinks/<vlink-id>/v1`.
+- A short-lived enrollment grant returned only at VLink creation. The VLink ID alone cannot initiate pairing.
+- Browser/device pairing with **two independent secrets**:
+  - an approval secret placed only in the QR/browser URL fragment;
+  - a device-exchange secret retained by the initiating tool/device and never placed in the QR.
+- Approval and credential issuance are separate operations. Browser approval cannot mint a workload token by itself.
+- One-time device exchange for an opaque, short-lived VLink bearer token.
+- Enrollment grants and workload tokens are stored hashed server-side rather than retained in usable form.
+- VLink access tokens are bound to one VLink and reject cross-VLink replay.
+- Immediate access-token revocation and TTL expiry.
+- Protected VLink-specific OpenAI-compatible, webhook, test, and activity routes.
+- Unbound global `/v1` compatibility disabled by default; explicit VLink binding plus a valid access token is required unless compatibility is deliberately enabled.
 - Live Gemini execution when `GEMINI_API_KEY` and a model are configured.
 - Explicit demo responses only when `VLINK_ENABLE_DEMO_RESPONSES=true`.
 - Custom HTTP target forwarding only to hosts explicitly listed in `VLINK_ALLOWED_TARGET_HOSTS`.
-- React UI for Create VLink, one-URL setup text, pairing QR/browser approval, connection test, and activity display.
-- Browser routes deliberately fall through to the Vite/static SPA while missing API routes remain fail-closed JSON 404s.
+- VLink bearer credentials are consumed at the VLink boundary and are **not forwarded** to an upstream custom target.
+- Webhook request bodies are not persisted in activity records.
+- React UI for Create → QR approval → automatic device exchange → temporary token → authenticated test/activity.
+- Browser routes fall through to the SPA while missing API routes stay fail-closed JSON 404s.
+
+## Proof gate
+
+The current short-lived-access branch has passed a clean GitHub Actions gate with:
+
+- **23 tests passed, 0 failed**
+- `tsc --noEmit`
+- production Vite + server build
+
+The adversarial suite covers VLink-ID-only denial, enrollment-grant binding, production creation fail-closed behavior, secret-free manifests, QR/device-secret separation, approval/exchange separation, wrong-device denial, one-time exchange, access-token binding, cross-VLink replay denial, expiry, revocation, unbound-route denial, authenticated activity, webhook body non-persistence, and prevention of VLink bearer-token forwarding to an upstream target.
 
 ## Not claimed / not implemented yet
 
@@ -35,15 +51,17 @@ VLink does **not** currently claim any of the following:
 - Cryptographically signed or independently verifiable receipts.
 - Durable database persistence.
 - Production SPIFFE/SPIRE workload identity issuance or verification.
-- Production authentication/authorization for VLink management or execution traffic.
-- A post-pairing workload access credential. The current pairing flow proves one-time user approval; credential issuance/exchange is the next security slice.
+- Veklom account/workspace authentication for management routes. Production-style configuration therefore disables unauthenticated VLink creation rather than inventing account authority.
 - Hardware attestation or enclave verification.
 - Formal non-repudiation.
-- Verified multi-cloud failover or zero-downtime switching.
+- Verified multi-provider failover or zero-downtime switching.
+- General zero-data-loss rollback. Compensation semantics must be defined and verified per consequence type/provider.
 - Full MCP transport. `/mcp/v1` is an explicit `501 planned` placeholder.
-- Full Veklom capability/policy enforcement. The VLink record reserves opaque references for future integration, but this repo does not pretend those services exist here.
+- Full Veklom Capability OS policy/capability enforcement. The VLink record reserves references for that integration but this repo does not pretend the boundary is already attached.
 
-Activity entries are therefore called **activity events**, not cryptographic receipts.
+Activity entries are therefore still called **activity events**, not cryptographic receipts.
+
+The OmniConnect prototype contains additional candidate capabilities—signed receipts, delegation, compensation/rollback, shadow evaluation, backend promotion/failover, MCP tooling, no-code integrations, control sockets, and connection UX. Those are treated as implementation targets, not discarded ideas: each capability must be implemented against a falsifiable contract and earn its claim independently.
 
 ## Run locally
 
@@ -62,8 +80,6 @@ npm run lint
 npm run build
 ```
 
-The current boundary suite covers VLink creation, secret-free manifests, endpoint-swap binding, conflicting/unknown IDs, one-time browser pairing, pairing expiry/replay, UI-route fallthrough, API fail-closed behavior, VLink-bound activity, and prototype OpenAI/webhook compatibility.
-
 ## Environment variables
 
 | Variable | Purpose |
@@ -71,14 +87,18 @@ The current boundary suite covers VLink creation, secret-free manifests, endpoin
 | `PORT` | HTTP port. Default `3000`. |
 | `VLINK_PUBLIC_ORIGIN` | Canonical public origin used in generated manifests/endpoints. |
 | `VLINK_CORS_ORIGIN` | Allowed browser origin. Default `*` for local/prototype use; set explicitly in production. |
+| `VLINK_ENROLLMENT_TTL_SECONDS` | Enrollment-grant lifetime. Default `900`, clamped to at most one hour. |
+| `VLINK_ACCESS_TOKEN_TTL_SECONDS` | Temporary workload-token lifetime. Default `3600`, clamped to at most one day. |
+| `VLINK_ALLOW_UNBOUND_COMPAT` | Deliberately enable unbound global compatibility traffic. Defaults off. |
+| `VLINK_ALLOW_UNAUTHENTICATED_CREATE` | Explicit override allowing unauthenticated VLink creation in production. Defaults off in production. |
 | `GEMINI_API_KEY` | Enables live Gemini-backed chat completion execution. |
 | `GEMINI_MODEL` | Gemini model identifier used for live execution. |
-| `VLINK_ENABLE_DEMO_RESPONSES` | Set `true` only when you intentionally want clearly labeled demo chat responses. Defaults off. |
-| `VLINK_ALLOWED_TARGET_HOSTS` | Comma-separated host allowlist for `X-Target-Url` forwarding. Arbitrary target URLs are rejected. |
+| `VLINK_ENABLE_DEMO_RESPONSES` | Set `true` only for deliberately labeled demo chat responses. Defaults off. |
+| `VLINK_ALLOWED_TARGET_HOSTS` | Comma-separated hostname allowlist for `X-Target-Url`. Arbitrary target URLs are rejected. |
 
-## Core API
+## Connection protocol
 
-Create a VLink:
+### 1. Create the VLink
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/vlinks \
@@ -91,65 +111,83 @@ curl -X POST http://localhost:3000/api/v1/vlinks \
   }'
 ```
 
-The returned VLink contains a base URL like:
+The creation response contains:
 
-```text
-http://localhost:3000/vlinks/vlk_abc123/v1
-```
+- the non-secret VLink record;
+- an expiring `vle_...` enrollment grant;
+- the manifest location.
 
-Use that as the client's OpenAI-compatible base URL. The connection URL itself binds traffic to the VLink, so no `X-VLink-Id` header is required:
+The enrollment grant authorizes **pairing initiation only**. It is not accepted as workload authority.
 
-```bash
-curl -X POST http://localhost:3000/vlinks/<vlink-id>/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"your-model","messages":[{"role":"user","content":"hello"}]}'
-```
-
-The global `/v1` compatibility route remains available and can still be explicitly bound with `X-VLink-Id` for clients that need that pattern.
-
-Read the machine-readable manifest:
-
-```bash
-curl http://localhost:3000/api/v1/vlinks/<vlink-id>/manifest
-```
-
-Run the internal connection test:
-
-```bash
-curl -X POST http://localhost:3000/api/v1/vlinks/<vlink-id>/test \
-  -H 'content-type: application/json' -d '{}'
-```
-
-Read activity:
-
-```bash
-curl http://localhost:3000/api/v1/vlinks/<vlink-id>/activity
-```
-
-Start browser pairing:
+### 2. Initiate pairing
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/vlinks/<vlink-id>/pairing \
   -H 'content-type: application/json' \
+  -H 'Authorization: Bearer <vle-enrollment-grant>' \
   -d '{"ttlSeconds":600}'
 ```
 
-The creator receives an expiring QR payload. Scanning it opens `/pair/<vlink-id>/<pairing-id>#code=<one-time-code>`. The fragment is processed by the browser UI and is not part of the HTTP request URL sent to the server. Approval is explicit and one-time.
+The initiating device receives an approval QR plus a separate `deviceCode`. The QR opens:
+
+```text
+/pair/<vlink-id>/<pairing-id>#approval=<one-time-approval-secret>
+```
+
+The approval secret is in the URL fragment, so the browser does not send it in the HTTP request path/query. The `deviceCode` is **not** present in the QR.
+
+### 3. Approve in the browser
+
+The browser calls the approval endpoint with the one-time approval secret. Approval changes the pairing state but returns no workload token.
+
+### 4. Exchange on the initiating device
+
+After approval, the initiating device exchanges its separate device code exactly once:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/vlinks/<vlink-id>/pairing/<pairing-id>/exchange \
+  -H 'content-type: application/json' \
+  -d '{"deviceCode":"<device-code>"}'
+```
+
+The response returns a temporary `vlt_...` VLink access token. Secret-bearing creation/pairing/exchange responses use `Cache-Control: no-store`.
+
+### 5. Use ordinary OpenAI-compatible configuration
+
+```text
+OPENAI_BASE_URL=http://localhost:3000/vlinks/<vlink-id>/v1
+OPENAI_API_KEY=<vlt-temporary-vlink-token>
+```
+
+No custom VLink header is needed on the self-binding URL.
+
+Example:
+
+```bash
+curl -X POST http://localhost:3000/vlinks/<vlink-id>/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'Authorization: Bearer <vlt-temporary-vlink-token>' \
+  -d '{"model":"your-model","messages":[{"role":"user","content":"hello"}]}'
+```
 
 Without a configured live provider, model execution returns `503` unless demo responses were deliberately enabled.
 
 ## Security posture of this release
 
-- **A VLink ID is a connection identifier, not authentication or authority.** Putting it in the URL makes connection binding frictionless; it does not make possession of the URL sufficient authorization for a production deployment.
-- Manifests contain connection metadata only; pairing secrets are not published in manifests.
-- Pairing approval codes are short-lived and one-time use.
-- Pairing approval codes live in a browser URL fragment, not the server-visible path or query string.
-- Public pairing-status responses strip the approval code and QR payload.
-- Unknown user-supplied VLink IDs are rejected before events are recorded.
-- A VLink-specific URL rejects a contradictory `X-VLink-Id`/query binding rather than silently reassigning the activity.
-- Webhook request bodies are accepted by the ingress route but are **not persisted** by the in-memory activity store; activity records store metadata such as payload size.
-- Arbitrary SSRF-style `X-Target-Url` forwarding is disabled by default and requires a hostname allowlist.
-- Registry, pairing, and activity state are lost when the process restarts. Production deployment requires persistent storage and an authentication/authorization layer before exposing management or execution routes publicly.
+- **VLink ID = connection identifier, not authority.**
+- **Enrollment grant = short-lived permission to initiate pairing, not execute workloads.**
+- **Browser approval = human/device approval, not a workload credential.**
+- **VLink access token = short-lived authority for one VLink.**
+- Enrollment grants and access tokens are stored as hashes server-side.
+- Approval secret and device-exchange secret are independent.
+- Approval and device exchange are one-time transitions.
+- Access tokens expire and can be revoked immediately.
+- Access tokens cannot be replayed against another VLink.
+- VLink bearer tokens are never forwarded as upstream authorization when using an allowlisted custom target.
+- Manifests never publish enrollment, pairing, or workload credentials.
+- Unknown or contradictory VLink bindings fail before execution/activity creation.
+- Request/response bodies are not copied into VLink activity events by these routes.
+- In-memory state is lost on restart. Durable persistence remains required before production service claims.
 
 ## Architecture boundary
 
@@ -159,12 +197,14 @@ Veklom Capability OS
         └── VLink
               ├── portable connection object
               ├── self-binding connection URL
-              ├── non-secret discovery manifest
-              ├── short-lived browser approval / pairing
+              ├── secret-free discovery manifest
+              ├── short-lived enrollment grant
+              ├── browser approval + device exchange
+              ├── temporary VLink access token
               ├── OpenAI-compatible ingress
               ├── webhook ingress
               ├── activity events
               └── future identity / capability / policy / evidence bindings
 ```
 
-VLink is not the whole Capability OS. It is the low-friction connection primitive that makes the rest of Veklom reachable.
+VLink is not the whole Capability OS. It is the connection primitive that makes the rest of Veklom reachable with minimum integration friction.

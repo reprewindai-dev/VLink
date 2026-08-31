@@ -11,7 +11,7 @@ export type VLinkSourceType =
   | "cicd"
   | "container";
 export type VLinkConnectionStatus = "created" | "paired" | "active" | "expired" | "revoked";
-export type VLinkEnrollmentStatus = "unpaired" | "pending" | "paired" | "expired";
+export type VLinkEnrollmentStatus = "unpaired" | "pending" | "approved" | "paired" | "expired";
 
 export interface VLinkEndpoints {
   openaiCompatibleBaseUrl: string;
@@ -64,6 +64,11 @@ export interface VLinkManifest {
     status: VLinkEnrollmentStatus;
     pairingRequired: boolean;
   };
+  access: {
+    scheme: "bearer";
+    temporaryCredentials: true;
+    tokenPublishedInManifest: false;
+  };
   generatedAt: string;
 }
 
@@ -81,14 +86,59 @@ export interface VLinkActivityEvent {
   metadata: Record<string, string | number | boolean | null>;
 }
 
+export interface VLinkEnrollmentGrant {
+  grantId: string;
+  vlinkId: string;
+  token: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+export interface VLinkEnrollmentGrantSummary {
+  grantId: string;
+  vlinkId: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+export type VLinkPairingStatus = "pending" | "approved" | "exchanged" | "expired";
+
 export interface VLinkPairingRequest {
   pairingId: string;
   vlinkId: string;
-  oneTimeCode: string;
+  approvalCode: string;
+  deviceCode: string;
   pairingUrl: string;
   qrPayload: string;
-  status: "pending" | "completed" | "expired";
+  status: VLinkPairingStatus;
   createdAt: string;
   expiresAt: string;
-  completedAt?: string;
+}
+
+export interface VLinkPairingStatusView {
+  pairingId: string;
+  vlinkId: string;
+  pairingUrl: string;
+  status: VLinkPairingStatus;
+  createdAt: string;
+  expiresAt: string;
+  approvedAt?: string;
+  exchangedAt?: string;
+}
+
+export interface VLinkAccessCredential {
+  credentialId: string;
+  vlinkId: string;
+  token: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+export interface VLinkAccessCredentialSummary {
+  credentialId: string;
+  vlinkId: string;
+  issuedAt: string;
+  expiresAt: string;
+  status: "active" | "expired" | "revoked";
+  revokedAt?: string;
 }
