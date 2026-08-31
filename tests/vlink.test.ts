@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { createPublicKey, verify as ed25519Verify } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { createApp } from "../src/server/app";
+import { canonicalizeVLinkJson } from "../src/server/receiptSigner";
+import { installReceiptSupport } from "../src/server/receiptSupport";
 import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
+import type { VLinkSignedReceipt } from "../src/types/vlink";
 
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({
@@ -13,6 +17,7 @@ const { app } = createApp({
   accessTokenTtlSeconds: 3600,
   enrollmentGrantTtlSeconds: 900,
 });
+const receiptSupport = installReceiptSupport(app, registry);
 app.get("*", (_req, res) => res.status(200).type("text/plain").send("ui-fallback"));
 
 let base = "";
@@ -117,6 +122,20 @@ async function approveAndExchange(created: CreatedVLink): Promise<{ pairing: Pai
 }
 
 const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+async function createSignedTestReceipt() {
+  const created = await createVLink();
+  const { credential } = await approveAndExchange(created);
+  const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/test`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...bearer(credential.token) },
+    body: "{}",
+  });
+  assert.equal(response.status, 200);
+  const receipts = receiptSupport.receipts(created.vlink.vlinkId);
+  assert.ok(receipts.length > 0);
+  return { created, credential, receipt: receipts[0] };
+}
 
 
 test("browser routes fall through to the UI layer while API misses stay fail-closed", async () => {
@@ -507,4 +526,102 @@ test("VLink bearer token is never forwarded to an allowlisted custom target", as
     if (previous === undefined) delete process.env.VLINK_ALLOWED_TARGET_HOSTS;
     else process.env.VLINK_ALLOWED_TARGET_HOSTS = previous;
   }
+});
+
+
+test("every real VLink activity produces an Ed25519 signed receipt with matching event identity", async () => {
+  const { created, receipt } = await createSignedTestReceipt();
+  assert.equal(receipt.version, "vlink-receipt/v1");
+  assert.equal(receipt.algorithm, "Ed25519");
+  assert.equal(receipt.digestAlgorithm, "SHA-256");
+  assert.equal(receipt.vlinkId, created.vlink.vlinkId);
+  assert.equal(receipt.eventId, receipt.payload.eventId);
+  assert.match(receipt.payloadHash, /^sha256:[a-f0-9]{64}$/);
+  assert.match(receipt.keyId, /^vkey_sha256_[a-f0-9]{64}$/);
+  assert.ok(receipt.signature.length > 40);
+});
+
+
+test("a receipt verifies independently with raw Node Ed25519 using only the embedded public key", async () => {
+  const { receipt } = await createSignedTestReceipt();
+  const { signature, ...unsigned } = receipt;
+  const publicKey = createPublicKey({ key: receipt.publicKeyJwk as never, format: "jwk" });
+  const valid = ed25519Verify(
+    null,
+    Buffer.from(canonicalizeVLinkJson(unsigned)),
+    publicKey,
+    Buffer.from(signature, "base64url"),
+  );
+  assert.equal(valid, true);
+});
+
+
+test("mutating a signed receipt payload makes verification fail", async () => {
+  const { receipt } = await createSignedTestReceipt();
+  const tampered = structuredClone(receipt) as VLinkSignedReceipt;
+  tampered.payload.status = tampered.payload.status === "completed" ? "failed" : "completed";
+
+  const response = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt: tampered }),
+  });
+  assert.equal(response.status, 200);
+  const verification = await response.json() as { valid: boolean; payloadHashValid: boolean; signatureValid: boolean };
+  assert.equal(verification.valid, false);
+  assert.equal(verification.payloadHashValid, false);
+  assert.equal(verification.signatureValid, false);
+});
+
+
+test("changing the public key fingerprint or pinning the wrong key fails verification", async () => {
+  const { receipt } = await createSignedTestReceipt();
+  const wrongFingerprint = structuredClone(receipt) as VLinkSignedReceipt;
+  wrongFingerprint.keyId = `vkey_sha256_${"0".repeat(64)}`;
+
+  const changedKey = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt: wrongFingerprint }),
+  });
+  const changedKeyResult = await changedKey.json() as { valid: boolean; keyIdValid: boolean };
+  assert.equal(changedKeyResult.valid, false);
+  assert.equal(changedKeyResult.keyIdValid, false);
+
+  const wrongPin = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt, expectedKeyId: `vkey_sha256_${"f".repeat(64)}` }),
+  });
+  const wrongPinResult = await wrongPin.json() as { valid: boolean; expectedKeyMatched: boolean };
+  assert.equal(wrongPinResult.valid, false);
+  assert.equal(wrongPinResult.expectedKeyMatched, false);
+});
+
+
+test("receipt key descriptor matches receipts and explicitly discloses ephemeral trust when no operator key is configured", async () => {
+  const { receipt } = await createSignedTestReceipt();
+  const response = await fetch(`${base}/.well-known/vlink-receipt-key.json`);
+  assert.equal(response.status, 200);
+  const descriptor = await response.json() as { keyId: string; algorithm: string; persistence: string; trustNote: string };
+  assert.equal(descriptor.keyId, receipt.keyId);
+  assert.equal(descriptor.algorithm, "Ed25519");
+  assert.equal(descriptor.persistence, "ephemeral");
+  assert.ok(descriptor.trustNote.includes("ephemeral"));
+});
+
+
+test("receipt retrieval requires VLink authority and signed receipts never contain the bearer token", async () => {
+  const { created, credential, receipt } = await createSignedTestReceipt();
+  const denied = await fetch(`${base}/receipts/vlinks/${created.vlink.vlinkId}`);
+  assert.equal(denied.status, 401);
+
+  const allowed = await fetch(`${base}/receipts/vlinks/${created.vlink.vlinkId}`, {
+    headers: bearer(credential.token),
+  });
+  assert.equal(allowed.status, 200);
+  const text = await allowed.text();
+  assert.equal(text.includes(credential.token), false);
+  assert.equal(text.includes(receipt.receiptId), true);
+  assert.equal(JSON.stringify(receipt).includes(credential.token), false);
 });
