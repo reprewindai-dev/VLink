@@ -145,8 +145,8 @@ export class FileBackedVLinkRegistry implements VLinkRegistry {
     const tempPath = `${this.statePath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     let fd: number | undefined;
     try {
-      writeFileSync(tempPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      fd = openSync(tempPath, "r");
+      fd = openSync(tempPath, "wx", 0o600);
+      writeFileSync(fd, payload, { encoding: "utf8" });
       fsyncSync(fd);
       closeSync(fd);
       fd = undefined;
