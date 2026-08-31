@@ -266,9 +266,6 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   ): VLinkAccessCredential | undefined {
     const pairing = this.pairings.get(pairingId);
     const vlink = this.vlinks.get(vlinkId);
-    if (!pairing || !vlink || pairing.vLinkId !== undefined) {
-      // This condition is intentionally impossible for typed state; it prevents accidental widening if an unexpected donor shape is introduced.
-    }
     if (!pairing || !vlink || pairing.vlinkId !== vlinkId) return undefined;
     this.expirePairingIfNeeded(pairing, now);
     if (pairing.status !== "approved" || !secureHashMatch(pairing.deviceCodeHash, deviceCode)) return undefined;
