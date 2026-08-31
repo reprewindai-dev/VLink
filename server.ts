@@ -3,11 +3,13 @@ import dotenv from "dotenv";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { createApp } from "./src/server/app";
+import { installReceiptSupport } from "./src/server/receiptSupport";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3000);
-const { app } = createApp({ publicOrigin: process.env.VLINK_PUBLIC_ORIGIN });
+const { app, registry } = createApp({ publicOrigin: process.env.VLINK_PUBLIC_ORIGIN });
+installReceiptSupport(app, registry, { privateKeyPem: process.env.VLINK_RECEIPT_PRIVATE_KEY_PEM });
 
 if (process.env.NODE_ENV !== "production") {
   const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
