@@ -211,6 +211,7 @@ export const installFailoverSupport = (
     const totalLatencyMs = Math.max(0, Math.round(performance.now() - started));
     const primaryAttempt = result.attempts[0];
     const secondaryAttempt = result.attempts[1];
+    const finalBackend = secondaryAttempt ? secondary.host : primary.host;
 
     registry.addActivity({
       vlinkId: vlink.vlinkId,
@@ -220,7 +221,7 @@ export const installFailoverSupport = (
       mode: vlink.mode,
       status: result.response.status >= 500 ? "failed" : "completed",
       latencyMs: totalLatencyMs,
-      backend: result.recovered ? secondary.host : primary.host,
+      backend: finalBackend,
       metadata: {
         evidenceType: "bounded-failover-attempt",
         credentialId: credential.credentialId,
