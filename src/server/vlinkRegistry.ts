@@ -43,6 +43,15 @@ interface StoredCredential {
   revokedAt?: string;
 }
 
+export interface VLinkRegistrySnapshot {
+  format: "vlink-registry/v1";
+  vlinks: VLinkRecord[];
+  enrollmentGrants: StoredEnrollmentGrant[];
+  pairings: StoredPairing[];
+  credentials: StoredCredential[];
+  activities: Array<{ vlinkId: string; events: VLinkActivityEvent[] }>;
+}
+
 export interface VLinkRegistry {
   create(input: CreateVLinkInput, origin: string): VLinkRecord;
   list(): VLinkRecord[];
@@ -67,6 +76,19 @@ const secureHashMatch = (expectedHash: string, providedSecret: string) => {
   const expected = Buffer.from(expectedHash, "hex");
   const actual = Buffer.from(hashSecret(providedSecret), "hex");
   return expected.length === actual.length && timingSafeEqual(expected, actual);
+};
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const assertString: (value: unknown, field: string) => asserts value is string = (value, field) => {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Invalid durable VLink state: ${field}`);
+};
+
+const assertHash: (value: unknown, field: string) => asserts value is string = (value, field) => {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`Invalid durable VLink state: ${field}`);
+  }
 };
 
 export class InMemoryVLinkRegistry implements VLinkRegistry {
@@ -303,6 +325,108 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     this.pairings.clear();
     this.credentials.clear();
     this.activities.clear();
+  }
+
+  exportSnapshot(): VLinkRegistrySnapshot {
+    return {
+      format: "vlink-registry/v1",
+      vlinks: Array.from(this.vlinks.values()).map((value) => structuredClone(value)),
+      enrollmentGrants: Array.from(this.enrollmentGrants.values()).map((value) => structuredClone(value)),
+      pairings: Array.from(this.pairings.values()).map((value) => structuredClone(value)),
+      credentials: Array.from(this.credentials.values()).map((value) => structuredClone(value)),
+      activities: Array.from(this.activities.entries()).map(([vlinkId, events]) => ({
+        vlinkId,
+        events: events.map((event) => structuredClone(event)),
+      })),
+    };
+  }
+
+  restoreSnapshot(value: unknown): void {
+    if (!isObject(value) || value.format !== "vlink-registry/v1") {
+      throw new Error("Invalid durable VLink state: unsupported format");
+    }
+    const vlinks = value.vlinks;
+    const enrollmentGrants = value.enrollmentGrants;
+    const pairings = value.pairings;
+    const credentials = value.credentials;
+    const activities = value.activities;
+    if (!Array.isArray(vlinks) || !Array.isArray(enrollmentGrants) || !Array.isArray(pairings) || !Array.isArray(credentials) || !Array.isArray(activities)) {
+      throw new Error("Invalid durable VLink state: malformed collections");
+    }
+
+    const nextVlinks = new Map<string, VLinkRecord>();
+    for (const item of vlinks) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: vlink entry");
+      assertString(item.vlinkId, "vlinkId");
+      if (!/^vlk_[a-f0-9]{16}$/.test(item.vlinkId)) throw new Error("Invalid durable VLink state: vlinkId");
+      if (nextVlinks.has(item.vlinkId)) throw new Error("Invalid durable VLink state: duplicate vlinkId");
+      if (item.version !== VLINK_SCHEMA_VERSION) throw new Error("Invalid durable VLink state: schema version");
+      nextVlinks.set(item.vlinkId, structuredClone(item as unknown as VLinkRecord));
+    }
+
+    const known = (vlinkId: unknown, field: string): vlinkId is string => {
+      assertString(vlinkId, field);
+      if (!nextVlinks.has(vlinkId)) throw new Error(`Invalid durable VLink state: orphan ${field}`);
+      return true;
+    };
+
+    const nextGrants = new Map<string, StoredEnrollmentGrant>();
+    for (const item of enrollmentGrants) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: enrollment grant");
+      assertString(item.grantId, "grantId");
+      known(item.vlinkId, "grant.vlinkId");
+      assertHash(item.tokenHash, "grant.tokenHash");
+      assertString(item.issuedAt, "grant.issuedAt");
+      assertString(item.expiresAt, "grant.expiresAt");
+      if (nextGrants.has(item.grantId)) throw new Error("Invalid durable VLink state: duplicate grantId");
+      nextGrants.set(item.grantId, structuredClone(item as unknown as StoredEnrollmentGrant));
+    }
+
+    const nextPairings = new Map<string, StoredPairing>();
+    for (const item of pairings) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: pairing");
+      assertString(item.pairingId, "pairingId");
+      known(item.vlinkId, "pairing.vlinkId");
+      assertHash(item.approvalCodeHash, "pairing.approvalCodeHash");
+      assertHash(item.deviceCodeHash, "pairing.deviceCodeHash");
+      assertString(item.createdAt, "pairing.createdAt");
+      assertString(item.expiresAt, "pairing.expiresAt");
+      if (nextPairings.has(item.pairingId)) throw new Error("Invalid durable VLink state: duplicate pairingId");
+      nextPairings.set(item.pairingId, structuredClone(item as unknown as StoredPairing));
+    }
+
+    const nextCredentials = new Map<string, StoredCredential>();
+    for (const item of credentials) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: credential");
+      assertString(item.credentialId, "credentialId");
+      known(item.vlinkId, "credential.vlinkId");
+      assertHash(item.tokenHash, "credential.tokenHash");
+      assertString(item.issuedAt, "credential.issuedAt");
+      assertString(item.expiresAt, "credential.expiresAt");
+      if (item.revokedAt !== undefined) assertString(item.revokedAt, "credential.revokedAt");
+      if (nextCredentials.has(item.credentialId)) throw new Error("Invalid durable VLink state: duplicate credentialId");
+      nextCredentials.set(item.credentialId, structuredClone(item as unknown as StoredCredential));
+    }
+
+    const nextActivities = new Map<string, VLinkActivityEvent[]>();
+    for (const item of activities) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: activity collection");
+      assertString(item.vlinkId, "activity.vlinkId");
+      if (!nextVlinks.has(item.vlinkId)) throw new Error("Invalid durable VLink state: orphan activity.vlinkId");
+      if (!Array.isArray(item.events)) throw new Error("Invalid durable VLink state: activity events");
+      if (nextActivities.has(item.vlinkId)) throw new Error("Invalid durable VLink state: duplicate activity collection");
+      nextActivities.set(item.vlinkId, structuredClone(item.events as VLinkActivityEvent[]).slice(0, 100));
+    }
+    for (const vlinkId of nextVlinks.keys()) {
+      if (!nextActivities.has(vlinkId)) nextActivities.set(vlinkId, []);
+    }
+
+    this.clear();
+    for (const [key, item] of nextVlinks) this.vlinks.set(key, item);
+    for (const [key, item] of nextGrants) this.enrollmentGrants.set(key, item);
+    for (const [key, item] of nextPairings) this.pairings.set(key, item);
+    for (const [key, item] of nextCredentials) this.credentials.set(key, item);
+    for (const [key, item] of nextActivities) this.activities.set(key, item);
   }
 
   private issueCredential(vlinkId: string, ttlSeconds: number, now: Date): VLinkAccessCredential {
