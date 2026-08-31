@@ -3,15 +3,24 @@ import dotenv from "dotenv";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { createApp } from "./src/server/app";
+import { FileBackedVLinkRegistry } from "./src/server/fileBackedRegistry";
 import { installFailoverSupport } from "./src/server/failoverSupport";
 import { installReceiptSupport } from "./src/server/receiptSupport";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3000);
-const { app, registry } = createApp({ publicOrigin: process.env.VLINK_PUBLIC_ORIGIN });
-installReceiptSupport(app, registry, { privateKeyPem: process.env.VLINK_RECEIPT_PRIVATE_KEY_PEM });
-installFailoverSupport(app, registry, { timeoutMs: Number(process.env.VLINK_FAILOVER_TIMEOUT_MS ?? 4_000) });
+const statePath = process.env.VLINK_STATE_PATH?.trim();
+if (process.env.NODE_ENV === "production" && !statePath) {
+  throw new Error("VLINK_STATE_PATH is required in production so VLink identity and access state survive process restarts");
+}
+const registry = statePath ? new FileBackedVLinkRegistry({ statePath }) : undefined;
+const { app, registry: activeRegistry } = createApp({
+  registry,
+  publicOrigin: process.env.VLINK_PUBLIC_ORIGIN,
+});
+installReceiptSupport(app, activeRegistry, { privateKeyPem: process.env.VLINK_RECEIPT_PRIVATE_KEY_PEM });
+installFailoverSupport(app, activeRegistry, { timeoutMs: Number(process.env.VLINK_FAILOVER_TIMEOUT_MS ?? 4_000) });
 
 if (process.env.NODE_ENV !== "production") {
   const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
