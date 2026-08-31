@@ -81,11 +81,11 @@ const secureHashMatch = (expectedHash: string, providedSecret: string) => {
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const assertString = (value: unknown, field: string): asserts value is string => {
+const assertString: (value: unknown, field: string) => asserts value is string = (value, field) => {
   if (typeof value !== "string" || value.length === 0) throw new Error(`Invalid durable VLink state: ${field}`);
 };
 
-const assertHash = (value: unknown, field: string): asserts value is string => {
+const assertHash: (value: unknown, field: string) => asserts value is string = (value, field) => {
   if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
     throw new Error(`Invalid durable VLink state: ${field}`);
   }
