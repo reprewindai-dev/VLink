@@ -21,3 +21,15 @@ jobs:
       - run: npm test
       - run: npm run lint
       - run: npm run build
+
+  windows-durable-state:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: node --import tsx --test tests/persistence.test.ts
+      - run: npm run lint
