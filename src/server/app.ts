@@ -9,6 +9,7 @@ export interface CreateAppOptions {
   enableDemoResponses?: boolean;
   allowUnboundCompatibility?: boolean;
   allowUnauthenticatedCreate?: boolean;
+  authorizeWorkspace?: (token: string, workspaceId: string) => Promise<boolean>;
   enrollmentGrantTtlSeconds?: number;
   accessTokenTtlSeconds?: number;
 }
@@ -46,6 +47,26 @@ const getBearerToken = (req: Request): string | undefined => {
 const clampSeconds = (value: number, fallback: number, max: number) => {
   if (!Number.isFinite(value)) return fallback;
   return Math.min(Math.max(Math.floor(value), 1), max);
+};
+
+export const authorizeWorkspaceWithLockerPhycer = async (token: string, workspaceId: string): Promise<boolean> => {
+  const lockerPhycerUrl = (process.env.LOCKERPHYCER_URL ?? "").replace(/\/+$/, "");
+  if (!lockerPhycerUrl) return false;
+  try {
+    const response = await fetch(
+      `${lockerPhycerUrl}/api/v1/workspace/${encodeURIComponent(workspaceId)}/vlink-authorization`,
+      {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(5_000),
+      },
+    );
+    if (!response.ok) return false;
+    const decision = await response.json() as { authorized?: unknown; workspace_id?: unknown };
+    return decision.authorized === true && decision.workspace_id === workspaceId;
+  } catch {
+    return false;
+  }
 };
 
 const parseAllowedTargetHosts = () =>
@@ -94,6 +115,7 @@ export function createApp(options: CreateAppOptions = {}) {
   const allowUnauthenticatedCreate =
     options.allowUnauthenticatedCreate ??
     (process.env.NODE_ENV !== "production" || process.env.VLINK_ALLOW_UNAUTHENTICATED_CREATE === "true");
+  const authorizeWorkspace = options.authorizeWorkspace ?? authorizeWorkspaceWithLockerPhycer;
   const enrollmentGrantTtlSeconds = clampSeconds(
     options.enrollmentGrantTtlSeconds ?? Number(process.env.VLINK_ENROLLMENT_TTL_SECONDS ?? 900),
     900,
@@ -200,12 +222,22 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.post("/api/v1/vlinks", (req, res) => {
+  app.post("/api/v1/vlinks", async (req, res) => {
     if (!allowUnauthenticatedCreate) {
-      return res.status(403).json({
-        error: "workspace_auth_required",
-        message: "Unauthenticated VLink creation is disabled in production until workspace/account authentication is integrated.",
-      });
+      const token = getBearerToken(req);
+      const workspaceId = String(req.body?.workspaceId ?? "").trim();
+      if (!token || token.startsWith("vle_") || token.startsWith("vlt_") || !workspaceId) {
+        return res.status(403).json({
+          error: "workspace_auth_required",
+          message: "An active LockerPhycer session bound to the requested workspace is required.",
+        });
+      }
+      if (!(await authorizeWorkspace(token, workspaceId))) {
+        return res.status(403).json({
+          error: "workspace_access_denied",
+          message: "The authenticated LockerPhycer session does not own the requested workspace.",
+        });
+      }
     }
 
     const { workspaceId, environment, displayName, sourceType, expiresAt } = req.body ?? {};

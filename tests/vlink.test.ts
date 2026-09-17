@@ -3,7 +3,7 @@ import { createPublicKey, verify as ed25519Verify } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
-import { createApp } from "../src/server/app";
+import { authorizeWorkspaceWithLockerPhycer, createApp } from "../src/server/app";
 import { canonicalizeVLinkJson } from "../src/server/receiptSigner";
 import { installReceiptSupport } from "../src/server/receiptSupport";
 import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
@@ -176,6 +176,101 @@ test("production-style configuration refuses unauthenticated VLink creation", as
     });
     assert.equal(response.status, 403);
     assert.equal(((await response.json()) as { error: string }).error, "workspace_auth_required");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
+test("production-style configuration accepts only the requested LockerPhycer-owned workspace", async () => {
+  const isolated = createApp({
+    allowUnauthenticatedCreate: false,
+    authorizeWorkspace: async (token, workspaceId) => token === "account-session" && workspaceId === "ws-owned",
+  });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    const allowed = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer account-session" },
+      body: JSON.stringify({ workspaceId: "ws-owned", environment: "production", displayName: "authorized", sourceType: "ai-client" }),
+    });
+    assert.equal(allowed.status, 201);
+
+    const denied = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer account-session" },
+      body: JSON.stringify({ workspaceId: "ws-other", environment: "production", displayName: "denied", sourceType: "ai-client" }),
+    });
+    assert.equal(denied.status, 403);
+    assert.equal(((await denied.json()) as { error: string }).error, "workspace_access_denied");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
+test("VLink validates LockerPhycer's authorization body instead of trusting HTTP 200", async () => {
+  const previous = process.env.LOCKERPHYCER_URL;
+  let responseBody: unknown = { authorized: true, workspace_id: "ws-owned" };
+  let responseStatus = 200;
+  let observedAuthorization: string | undefined;
+  let observedPath: string | undefined;
+  const lockerServer = createServer((req, res) => {
+    observedAuthorization = req.headers.authorization;
+    observedPath = req.url;
+    res.writeHead(responseStatus, { "content-type": "application/json" });
+    res.end(JSON.stringify(responseBody));
+  });
+  lockerServer.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => lockerServer.once("listening", () => resolve()));
+  process.env.LOCKERPHYCER_URL = `http://127.0.0.1:${(lockerServer.address() as AddressInfo).port}`;
+  try {
+    assert.equal(await authorizeWorkspaceWithLockerPhycer("session-token", "ws-owned"), true);
+    assert.equal(observedAuthorization, "Bearer session-token");
+    assert.equal(observedPath, "/api/v1/workspace/ws-owned/vlink-authorization");
+
+    responseBody = { authorized: true, workspace_id: "ws-other" };
+    assert.equal(await authorizeWorkspaceWithLockerPhycer("session-token", "ws-owned"), false);
+
+    responseBody = { authorized: false, workspace_id: "ws-owned" };
+    assert.equal(await authorizeWorkspaceWithLockerPhycer("session-token", "ws-owned"), false);
+
+    responseStatus = 403;
+    responseBody = { authorized: true, workspace_id: "ws-owned" };
+    assert.equal(await authorizeWorkspaceWithLockerPhycer("session-token", "ws-owned"), false);
+  } finally {
+    if (previous === undefined) delete process.env.LOCKERPHYCER_URL;
+    else process.env.LOCKERPHYCER_URL = previous;
+    await new Promise<void>((resolve, reject) => lockerServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
+test("production creation rejects VLink-local tokens before workspace authorization", async () => {
+  let authorizationCalls = 0;
+  const isolated = createApp({
+    allowUnauthenticatedCreate: false,
+    authorizeWorkspace: async () => {
+      authorizationCalls += 1;
+      return true;
+    },
+  });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    for (const token of ["vle_local", "vlt_local"]) {
+      const response = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ workspaceId: "ws-owned", environment: "production", displayName: "denied", sourceType: "ai-client" }),
+      });
+      assert.equal(response.status, 403);
+      assert.equal(((await response.json()) as { error: string }).error, "workspace_auth_required");
+    }
+    assert.equal(authorizationCalls, 0);
   } finally {
     await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
   }
