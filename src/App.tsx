@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 import { CheckCircle2, Copy, Link2, Play, QrCode, ShieldCheck, Unplug } from "lucide-react";
+import { readAccountToken, resolveOwnedWorkspace, type OwnedWorkspace } from "./account-session";
 import type {
   VLinkAccessCredential,
   VLinkActivityEvent,
@@ -25,7 +26,7 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const headers = new Headers(init?.headers);
   headers.set("content-type", "application/json");
   if (!headers.has("authorization")) {
-    const accountToken = window.localStorage.getItem("veklom.access_token") || window.localStorage.getItem("veklom_token");
+    const accountToken = readAccountToken(window.localStorage);
     if (accountToken) headers.set("authorization", `Bearer ${accountToken}`);
   }
   const response = await fetch(path, {
@@ -41,7 +42,7 @@ const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
 
 export default function App() {
   const [displayName, setDisplayName] = useState("My first VLink");
-  const [workspace, setWorkspace] = useState<{ id: string; name: string } | null>(null);
+  const [workspace, setWorkspace] = useState<OwnedWorkspace | null>(null);
   const [workspaceState, setWorkspaceState] = useState<"loading" | "ready" | "signed-out" | "missing" | "failed">("loading");
   const [environment, setEnvironment] = useState("development");
   const [sourceType, setSourceType] = useState<VLinkSourceType>("ai-client");
@@ -59,12 +60,12 @@ export default function App() {
   const [pairingApproval, setPairingApproval] = useState<"idle" | "approved" | "failed">("idle");
 
   useEffect(() => {
-    const accountToken = window.localStorage.getItem("veklom.access_token") || window.localStorage.getItem("veklom_token");
+    const accountToken = readAccountToken(window.localStorage);
     if (!accountToken) {
       setWorkspaceState("signed-out");
       return;
     }
-    api<{ id: string; name: string }>("/api/v1/workspace/me")
+    resolveOwnedWorkspace(accountToken)
       .then((resolvedWorkspace) => {
         setWorkspace(resolvedWorkspace);
         setWorkspaceState("ready");
