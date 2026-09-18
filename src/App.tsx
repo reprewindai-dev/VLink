@@ -22,12 +22,18 @@ const sourceOptions: Array<{ value: VLinkSourceType; label: string }> = [
 ];
 
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+  const headers = new Headers(init?.headers);
+  headers.set("content-type", "application/json");
+  if (!headers.has("authorization")) {
+    const accountToken = window.localStorage.getItem("veklom.access_token") || window.localStorage.getItem("veklom_token");
+    if (accountToken) headers.set("authorization", `Bearer ${accountToken}`);
+  }
   const response = await fetch(path, {
     ...init,
-    headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+    headers,
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.message || payload.error || `HTTP ${response.status}`);
+  if (!response.ok) throw new Error(payload.detail || payload.message || payload.error || `HTTP ${response.status}`);
   return payload as T;
 };
 
@@ -35,7 +41,8 @@ const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
 
 export default function App() {
   const [displayName, setDisplayName] = useState("My first VLink");
-  const [workspaceId, setWorkspaceId] = useState("default");
+  const [workspace, setWorkspace] = useState<{ id: string; name: string } | null>(null);
+  const [workspaceState, setWorkspaceState] = useState<"loading" | "ready" | "signed-out" | "missing" | "failed">("loading");
   const [environment, setEnvironment] = useState("development");
   const [sourceType, setSourceType] = useState<VLinkSourceType>("ai-client");
   const [vlink, setVlink] = useState<VLinkRecord | null>(null);
@@ -50,6 +57,24 @@ export default function App() {
   const [exchanging, setExchanging] = useState(false);
   const [pairingInfo, setPairingInfo] = useState<VLinkPairingStatusView | null>(null);
   const [pairingApproval, setPairingApproval] = useState<"idle" | "approved" | "failed">("idle");
+
+  useEffect(() => {
+    const accountToken = window.localStorage.getItem("veklom.access_token") || window.localStorage.getItem("veklom_token");
+    if (!accountToken) {
+      setWorkspaceState("signed-out");
+      return;
+    }
+    api<{ id: string; name: string }>("/api/v1/workspace/me")
+      .then((resolvedWorkspace) => {
+        setWorkspace(resolvedWorkspace);
+        setWorkspaceState("ready");
+      })
+      .catch((cause: unknown) => {
+        const message = cause instanceof Error ? cause.message : "Workspace lookup failed";
+        setWorkspaceState(/no workspace bound/i.test(message) ? "missing" : "failed");
+        setError(message);
+      });
+  }, []);
 
   const pairingTarget = useMemo(() => {
     const match = window.location.pathname.match(/^\/pair\/([^/]+)\/([^/]+)$/);
@@ -143,7 +168,7 @@ export default function App() {
     try {
       const result = await api<{ vlink: VLinkRecord; enrollmentGrant: VLinkEnrollmentGrant }>("/api/v1/vlinks", {
         method: "POST",
-        body: JSON.stringify({ workspaceId, environment, displayName, sourceType }),
+        body: JSON.stringify({ workspaceId: workspace?.id, environment, displayName, sourceType }),
       });
       setVlink(result.vlink);
       setEnrollmentGrant(result.enrollmentGrant);
@@ -286,11 +311,18 @@ export default function App() {
           <h2>Create a VLink</h2>
           <label>Name<input value={displayName} onChange={(e) => setDisplayName(e.target.value)} /></label>
           <div className="grid two compact">
-            <label>Workspace<input value={workspaceId} onChange={(e) => setWorkspaceId(e.target.value)} /></label>
+            <label>Workspace<input
+              value={workspaceState === "loading" ? "Resolving your workspace…" : workspace ? workspace.name : "No authenticated workspace"}
+              readOnly
+              aria-busy={workspaceState === "loading"}
+            /></label>
             <label>Environment<select value={environment} onChange={(e) => setEnvironment(e.target.value)}><option>development</option><option>staging</option><option>production</option></select></label>
           </div>
+          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" href="/login?returnTo=%2Fvlink%2Fconnect%2F">Sign in →</a></div>}
+          {workspaceState === "missing" && <div className="error">Finish Capability OS onboarding to bind a workspace before creating a VLink. <a className="manifest" href="/os/onboarding">Continue onboarding →</a></div>}
+          {workspaceState === "failed" && <div className="error">VLink could not verify your workspace. Refresh after the identity service is available.</div>}
           <label>What are you linking?<select value={sourceType} onChange={(e) => setSourceType(e.target.value as VLinkSourceType)}>{sourceOptions.map((o) => <option value={o.value} key={o.value}>{o.label}</option>)}</select></label>
-          <button className="primary" disabled={busy} onClick={createVLink}><Link2 size={17}/> {busy ? "Working…" : "Create VLink"}</button>
+          <button className="primary" disabled={busy || workspaceState !== "ready" || !workspace} onClick={createVLink}><Link2 size={17}/> {busy ? "Working…" : workspaceState === "loading" ? "Resolving workspace…" : "Create VLink"}</button>
           {error && <div className="error">{error}</div>}
         </article>
 
