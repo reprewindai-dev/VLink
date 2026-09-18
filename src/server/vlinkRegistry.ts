@@ -53,6 +53,7 @@ export interface VLinkRegistrySnapshot {
 }
 
 export interface VLinkRegistry {
+  readonly persistenceMode: "memory" | "file";
   create(input: CreateVLinkInput, origin: string): VLinkRecord;
   list(): VLinkRecord[];
   get(vlinkId: string): VLinkRecord | undefined;
@@ -92,6 +93,7 @@ const assertHash: (value: unknown, field: string) => asserts value is string = (
 };
 
 export class InMemoryVLinkRegistry implements VLinkRegistry {
+  readonly persistenceMode = "memory" as const;
   private readonly vlinks = new Map<string, VLinkRecord>();
   private readonly enrollmentGrants = new Map<string, StoredEnrollmentGrant>();
   private readonly pairings = new Map<string, StoredPairing>();

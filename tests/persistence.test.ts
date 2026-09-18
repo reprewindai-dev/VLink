@@ -28,6 +28,7 @@ const createLink = (registry: FileBackedVLinkRegistry) =>
 test("VLink identity, pairing, access, activity, and revocation survive process-style registry recreation", () => {
   withStatePath((statePath) => {
     const first = new FileBackedVLinkRegistry({ statePath });
+    assert.equal(first.persistenceMode, "file");
     const vlink = createLink(first);
     const enrollment = first.issueEnrollmentGrant(vlink.vlinkId, 900, new Date("2026-08-30T20:00:00Z"));
     assert.ok(enrollment);

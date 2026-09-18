@@ -217,7 +217,7 @@ export function createApp(options: CreateAppOptions = {}) {
       demoResponsesEnabled: enableDemoResponses,
       unboundCompatibilityEnabled: allowUnboundCompatibility,
       unauthenticatedCreateEnabled: allowUnauthenticatedCreate,
-      persistence: "memory",
+      persistence: registry.persistenceMode,
       timestamp: new Date().toISOString(),
     });
   });
