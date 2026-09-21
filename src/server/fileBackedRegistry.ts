@@ -21,28 +21,34 @@ import type {
   VLinkPairingRequest,
   VLinkPairingStatusView,
   VLinkRecord,
+  VLinkLeaseView,
 } from "../types/vlink";
 import {
+  type BindLeaseInput,
   InMemoryVLinkRegistry,
+  type LeasePatch,
   type CreateVLinkInput,
   type VLinkRegistry,
   type VLinkRegistrySnapshot,
 } from "./vlinkRegistry";
+import type { LeaseSealer } from "./leaseSealer";
 
 export interface FileBackedVLinkRegistryOptions {
   statePath: string;
+  leaseSealer?: LeaseSealer | null;
 }
 
 const stableJson = (snapshot: VLinkRegistrySnapshot) => `${JSON.stringify(snapshot, null, 2)}\n`;
 
 export class FileBackedVLinkRegistry implements VLinkRegistry {
-  private readonly inner = new InMemoryVLinkRegistry();
+  private readonly inner: InMemoryVLinkRegistry;
   private readonly statePath: string;
 
   constructor(options: FileBackedVLinkRegistryOptions) {
     const configured = options.statePath.trim();
     if (!configured) throw new Error("VLink durable state path must not be empty");
     this.statePath = path.resolve(configured);
+    this.inner = new InMemoryVLinkRegistry(options.leaseSealer);
     this.load();
   }
 
@@ -98,6 +104,30 @@ export class FileBackedVLinkRegistry implements VLinkRegistry {
 
   revokeCredential(vlinkId: string, credentialId: string, now?: Date): VLinkAccessCredentialSummary | undefined {
     return this.commit(() => this.inner.revokeCredential(vlinkId, credentialId, now));
+  }
+
+  configureLeaseSealer(sealer: LeaseSealer | null): void {
+    this.inner.configureLeaseSealer(sealer);
+  }
+
+  bindLease(vlinkId: string, input: BindLeaseInput): VLinkLeaseView | undefined {
+    return this.commit(() => this.inner.bindLease(vlinkId, input));
+  }
+
+  getLease(vlinkId: string, leaseId: string): VLinkLeaseView | undefined {
+    return this.inner.getLease(vlinkId, leaseId);
+  }
+
+  listLeases(vlinkId: string): VLinkLeaseView[] {
+    return this.inner.listLeases(vlinkId);
+  }
+
+  leaseSecret(vlinkId: string, leaseId: string) {
+    return this.inner.leaseSecret(vlinkId, leaseId);
+  }
+
+  updateLease(vlinkId: string, leaseId: string, patch: LeasePatch): VLinkLeaseView | undefined {
+    return this.commit(() => this.inner.updateLease(vlinkId, leaseId, patch));
   }
 
   addActivity(event: Omit<VLinkActivityEvent, "eventId" | "timestamp">, now?: Date): VLinkActivityEvent {

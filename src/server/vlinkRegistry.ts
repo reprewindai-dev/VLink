@@ -9,9 +9,12 @@ import type {
   VLinkPairingRequest,
   VLinkPairingStatusView,
   VLinkRecord,
+  VLinkLeaseStatus,
+  VLinkLeaseView,
   VLinkSourceType,
 } from "../types/vlink";
 import { VLINK_SCHEMA_VERSION } from "../types/vlink";
+import type { LeaseSealer } from "./leaseSealer";
 
 export interface CreateVLinkInput {
   workspaceId: string;
@@ -43,6 +46,49 @@ interface StoredCredential {
   revokedAt?: string;
 }
 
+export interface StoredLease {
+  leaseId: string;
+  vlinkId: string;
+  mountId: string;
+  tokenId: string;
+  nonce: string;
+  holderCredentialSealed: string;
+  packageRef: string;
+  workspace: string;
+  project: string;
+  targetRef: string;
+  allowedActions: string[];
+  blockedActions: string[];
+  issuedAt: string;
+  expiresAt: string;
+  status: VLinkLeaseStatus;
+  lastDecision?: {
+    action: string;
+    decision: "allow" | "deny";
+    reason: string;
+    at: string;
+  };
+}
+
+export interface BindLeaseInput {
+  mountId: string;
+  tokenId: string;
+  nonce: string;
+  holderCredential: string;
+  packageRef: string;
+  workspace: string;
+  project: string;
+  targetRef: string;
+  allowedActions: string[];
+  blockedActions: string[];
+  expiresAt: string;
+}
+
+export interface LeasePatch {
+  status?: VLinkLeaseStatus;
+  lastDecision?: StoredLease["lastDecision"];
+}
+
 export interface VLinkRegistrySnapshot {
   format: "vlink-registry/v1";
   vlinks: VLinkRecord[];
@@ -50,6 +96,7 @@ export interface VLinkRegistrySnapshot {
   pairings: StoredPairing[];
   credentials: StoredCredential[];
   activities: Array<{ vlinkId: string; events: VLinkActivityEvent[] }>;
+  leases: StoredLease[];
 }
 
 export interface VLinkRegistry {
@@ -65,6 +112,12 @@ export interface VLinkRegistry {
   exchangePairing(vlinkId: string, pairingId: string, deviceCode: string, credentialTtlSeconds?: number, now?: Date): VLinkAccessCredential | undefined;
   authenticate(vlinkId: string, token: string, now?: Date): VLinkAccessCredentialSummary | undefined;
   revokeCredential(vlinkId: string, credentialId: string, now?: Date): VLinkAccessCredentialSummary | undefined;
+  configureLeaseSealer(sealer: LeaseSealer | null): void;
+  bindLease(vlinkId: string, input: BindLeaseInput): VLinkLeaseView | undefined;
+  getLease(vlinkId: string, leaseId: string): VLinkLeaseView | undefined;
+  listLeases(vlinkId: string): VLinkLeaseView[];
+  leaseSecret(vlinkId: string, leaseId: string): { holderCredential: string; tokenId: string; nonce: string } | undefined;
+  updateLease(vlinkId: string, leaseId: string, patch: LeasePatch): VLinkLeaseView | undefined;
   addActivity(event: Omit<VLinkActivityEvent, "eventId" | "timestamp">, now?: Date): VLinkActivityEvent;
   activity(vlinkId: string): VLinkActivityEvent[];
   clear(): void;
@@ -96,7 +149,13 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   private readonly enrollmentGrants = new Map<string, StoredEnrollmentGrant>();
   private readonly pairings = new Map<string, StoredPairing>();
   private readonly credentials = new Map<string, StoredCredential>();
+  private readonly leases = new Map<string, StoredLease>();
   private readonly activities = new Map<string, VLinkActivityEvent[]>();
+  private leaseSealer?: LeaseSealer;
+
+  constructor(leaseSealer?: LeaseSealer | null) {
+    this.leaseSealer = leaseSealer ?? undefined;
+  }
 
   create(input: CreateVLinkInput, origin: string): VLinkRecord {
     const now = new Date().toISOString();
@@ -134,6 +193,67 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   get(vlinkId: string): VLinkRecord | undefined {
     const value = this.vlinks.get(vlinkId);
     return value ? structuredClone(value) : undefined;
+  }
+
+  configureLeaseSealer(sealer: LeaseSealer | null): void {
+    this.leaseSealer = sealer ?? undefined;
+  }
+
+  bindLease(vlinkId: string, input: BindLeaseInput): VLinkLeaseView | undefined {
+    if (!this.vlinks.has(vlinkId) || !this.leaseSealer) return undefined;
+    const leaseId = `lease_${randomUUID()}`;
+    const stored: StoredLease = {
+      leaseId,
+      vlinkId,
+      mountId: input.mountId,
+      tokenId: input.tokenId,
+      nonce: input.nonce,
+      holderCredentialSealed: this.leaseSealer.seal(input.holderCredential),
+      packageRef: input.packageRef,
+      workspace: input.workspace,
+      project: input.project,
+      targetRef: input.targetRef,
+      allowedActions: [...input.allowedActions],
+      blockedActions: [...input.blockedActions],
+      issuedAt: new Date().toISOString(),
+      expiresAt: input.expiresAt,
+      status: "active",
+    };
+    this.leases.set(leaseId, stored);
+    return this.leaseView(stored);
+  }
+
+  getLease(vlinkId: string, leaseId: string): VLinkLeaseView | undefined {
+    const lease = this.leases.get(leaseId);
+    return lease?.vlinkId === vlinkId ? this.leaseView(lease) : undefined;
+  }
+
+  listLeases(vlinkId: string): VLinkLeaseView[] {
+    return Array.from(this.leases.values())
+      .filter((lease) => lease.vlinkId === vlinkId)
+      .map((lease) => this.leaseView(lease));
+  }
+
+  leaseSecret(vlinkId: string, leaseId: string): { holderCredential: string; tokenId: string; nonce: string } | undefined {
+    const lease = this.leases.get(leaseId);
+    if (!lease || lease.vlinkId !== vlinkId || !this.leaseSealer) return undefined;
+    try {
+      return {
+        holderCredential: this.leaseSealer.open(lease.holderCredentialSealed),
+        tokenId: lease.tokenId,
+        nonce: lease.nonce,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  updateLease(vlinkId: string, leaseId: string, patch: LeasePatch): VLinkLeaseView | undefined {
+    const lease = this.leases.get(leaseId);
+    if (!lease || lease.vlinkId !== vlinkId) return undefined;
+    if (patch.status) lease.status = patch.status;
+    if (patch.lastDecision) lease.lastDecision = structuredClone(patch.lastDecision);
+    return this.leaseView(lease);
   }
 
   manifest(vlinkId: string): VLinkManifest | undefined {
@@ -324,6 +444,7 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     this.enrollmentGrants.clear();
     this.pairings.clear();
     this.credentials.clear();
+    this.leases.clear();
     this.activities.clear();
   }
 
@@ -338,6 +459,7 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
         vlinkId,
         events: events.map((event) => structuredClone(event)),
       })),
+      leases: Array.from(this.leases.values()).map((lease) => structuredClone(lease)),
     };
   }
 
@@ -350,7 +472,8 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     const pairings = value.pairings;
     const credentials = value.credentials;
     const activities = value.activities;
-    if (!Array.isArray(vlinks) || !Array.isArray(enrollmentGrants) || !Array.isArray(pairings) || !Array.isArray(credentials) || !Array.isArray(activities)) {
+    const leases = value.leases ?? [];
+    if (!Array.isArray(vlinks) || !Array.isArray(enrollmentGrants) || !Array.isArray(pairings) || !Array.isArray(credentials) || !Array.isArray(activities) || !Array.isArray(leases)) {
       throw new Error("Invalid durable VLink state: malformed collections");
     }
 
@@ -417,6 +540,43 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       if (nextActivities.has(item.vlinkId)) throw new Error("Invalid durable VLink state: duplicate activity collection");
       nextActivities.set(item.vlinkId, structuredClone(item.events as VLinkActivityEvent[]).slice(0, 100));
     }
+    const nextLeases = new Map<string, StoredLease>();
+    for (const item of leases) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: lease");
+      for (const field of ["leaseId", "vlinkId", "mountId", "tokenId", "nonce", "holderCredentialSealed", "packageRef", "workspace", "project", "targetRef", "issuedAt", "expiresAt"]) {
+        assertString(item[field], `lease.${field}`);
+      }
+      const leaseId = item.leaseId;
+      const leaseVlinkId = item.vlinkId;
+      assertString(leaseId, "lease.leaseId");
+      assertString(leaseVlinkId, "lease.vlinkId");
+      known(leaseVlinkId, "lease.vlinkId");
+      if (!Array.isArray(item.allowedActions) || !Array.isArray(item.blockedActions)) {
+        throw new Error("Invalid durable VLink state: lease action scope");
+      }
+      if (
+        !item.allowedActions.every((action) => typeof action === "string") ||
+        !item.blockedActions.every((action) => typeof action === "string")
+      ) {
+        throw new Error("Invalid durable VLink state: lease action scope");
+      }
+      if (!["active", "terminated", "expired"].includes(String(item.status))) {
+        throw new Error("Invalid durable VLink state: lease status");
+      }
+      if (item.lastDecision !== undefined) {
+        if (!isObject(item.lastDecision)) throw new Error("Invalid durable VLink state: lease decision");
+        if (
+          typeof item.lastDecision.action !== "string" ||
+          !["allow", "deny"].includes(String(item.lastDecision.decision)) ||
+          typeof item.lastDecision.reason !== "string" ||
+          typeof item.lastDecision.at !== "string"
+        ) {
+          throw new Error("Invalid durable VLink state: lease decision");
+        }
+      }
+      if (nextLeases.has(leaseId)) throw new Error("Invalid durable VLink state: duplicate leaseId");
+      nextLeases.set(leaseId, structuredClone(item as unknown as StoredLease));
+    }
     for (const vlinkId of nextVlinks.keys()) {
       if (!nextActivities.has(vlinkId)) nextActivities.set(vlinkId, []);
     }
@@ -426,7 +586,32 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     for (const [key, item] of nextGrants) this.enrollmentGrants.set(key, item);
     for (const [key, item] of nextPairings) this.pairings.set(key, item);
     for (const [key, item] of nextCredentials) this.credentials.set(key, item);
+    for (const [key, item] of nextLeases) this.leases.set(key, item);
     for (const [key, item] of nextActivities) this.activities.set(key, item);
+  }
+
+  private leaseView(lease: StoredLease): VLinkLeaseView {
+    const status =
+      lease.status === "active" && Date.parse(lease.expiresAt) <= Date.now()
+        ? "expired"
+        : lease.status;
+    return {
+      leaseId: lease.leaseId,
+      vlinkId: lease.vlinkId,
+      mountId: lease.mountId,
+      packageRef: lease.packageRef,
+      workspace: lease.workspace,
+      project: lease.project,
+      targetRef: lease.targetRef,
+      allowedActions: [...lease.allowedActions],
+      blockedActions: [...lease.blockedActions],
+      issuedAt: lease.issuedAt,
+      expiresAt: lease.expiresAt,
+      status,
+      ...(lease.lastDecision ? { lastDecision: structuredClone(lease.lastDecision) } : {}),
+      holderCredentialStored: true,
+      holderCredentialDisclosed: false,
+    };
   }
 
   private issueCredential(vlinkId: string, ttlSeconds: number, now: Date): VLinkAccessCredential {

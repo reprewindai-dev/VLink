@@ -84,7 +84,7 @@ export interface VLinkActivityEvent {
   status: "completed" | "accepted" | "failed";
   latencyMs: number;
   backend?: string;
-  metadata: Record<string, string | number | boolean | null>;
+  metadata: Record<string, unknown>;
 }
 
 export interface VLinkReceiptPublicKeyJwk {
@@ -173,6 +173,31 @@ export interface VLinkAccessCredential {
   token: string;
   issuedAt: string;
   expiresAt: string;
+}
+
+export type VLinkLeaseStatus = "active" | "terminated" | "expired";
+
+export interface VLinkLeaseView {
+  leaseId: string;
+  vlinkId: string;
+  mountId: string;
+  packageRef: string;
+  workspace: string;
+  project: string;
+  targetRef: string;
+  allowedActions: string[];
+  blockedActions: string[];
+  issuedAt: string;
+  expiresAt: string;
+  status: VLinkLeaseStatus;
+  lastDecision?: {
+    action: string;
+    decision: "allow" | "deny";
+    reason: string;
+    at: string;
+  };
+  holderCredentialStored: true;
+  holderCredentialDisclosed: false;
 }
 
 export interface VLinkAccessCredentialSummary {
