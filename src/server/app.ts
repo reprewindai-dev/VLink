@@ -1,6 +1,8 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { GoogleGenAI } from "@google/genai";
 import { InMemoryVLinkRegistry, type VLinkRegistry } from "./vlinkRegistry";
+import { createLeaseSealer } from "./leaseSealer";
+import * as cappoRelay from "./cappoRelay";
 import type { VLinkAccessCredentialSummary, VLinkSourceType } from "../types/vlink";
 
 export interface CreateAppOptions {
@@ -89,6 +91,8 @@ const safeManifestJson = (manifest: unknown) => {
 export function createApp(options: CreateAppOptions = {}) {
   const app = express();
   const registry = options.registry ?? new InMemoryVLinkRegistry();
+  const leaseSealer = createLeaseSealer();
+  registry.configureLeaseSealer(leaseSealer);
   const enableDemoResponses = options.enableDemoResponses ?? process.env.VLINK_ENABLE_DEMO_RESPONSES === "true";
   const allowUnboundCompatibility = options.allowUnboundCompatibility ?? process.env.VLINK_ALLOW_UNBOUND_COMPAT === "true";
   const allowUnauthenticatedCreate =
@@ -196,6 +200,8 @@ export function createApp(options: CreateAppOptions = {}) {
       unboundCompatibilityEnabled: allowUnboundCompatibility,
       unauthenticatedCreateEnabled: allowUnauthenticatedCreate,
       persistence: "memory",
+      leaseSealing: Boolean(leaseSealer),
+      capiConfigured: Boolean(process.env.VLINK_CAPI_BASE_URL?.trim()),
       timestamp: new Date().toISOString(),
     });
   });
@@ -319,6 +325,235 @@ export function createApp(options: CreateAppOptions = {}) {
     if (!credential) return res.status(400).json({ error: "invalid_device_code" });
     res.setHeader("Cache-Control", "no-store");
     res.json({ credential, pairing: registry.getPairingStatus(req.params.vlinkId, req.params.pairingId) });
+  });
+
+  const leaseActivity = (
+    vlinkId: string,
+    vlink: NonNullable<ReturnType<VLinkRegistry["get"]>>,
+    route: string,
+    method: string,
+    status: "completed" | "failed",
+    metadata: Record<string, unknown>,
+  ) =>
+    registry.addActivity({
+      vlinkId,
+      sourceType: vlink.sourceType,
+      route,
+      method,
+      mode: vlink.mode,
+      status,
+      latencyMs: 0,
+      backend: "cappo-interlink",
+      metadata,
+    });
+
+  const requireLeaseHuman = (req: Request, res: Response, vlinkId: string) => {
+    const token = getBearerToken(req);
+    if (!token || !token.startsWith("vle_")) {
+      res.setHeader("WWW-Authenticate", 'Bearer realm="VLink enrollment"');
+      res.status(401).json({ error: "enrollment_grant_required" });
+      return false;
+    }
+    if (!registry.authenticateEnrollment(vlinkId, token)) {
+      res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
+      res.status(401).json({ error: "invalid_or_expired_enrollment_grant" });
+      return false;
+    }
+    return true;
+  };
+
+  const requireLeaseEither = (req: Request, res: Response, vlinkId: string) => {
+    const token = getBearerToken(req);
+    if (token?.startsWith("vle_")) {
+      if (registry.authenticateEnrollment(vlinkId, token)) return true;
+      res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
+      res.status(401).json({ error: "invalid_or_expired_enrollment_grant" });
+      return false;
+    }
+    if (token?.startsWith("vlt_")) {
+      if (registry.authenticate(vlinkId, token)) return true;
+      res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
+      res.status(401).json({ error: "invalid_or_expired_vlink_access_token" });
+      return false;
+    }
+    res.setHeader("WWW-Authenticate", 'Bearer realm="VLink"');
+    res.status(401).json({ error: "vlink_credential_required" });
+    return false;
+  };
+
+  const relayBody = (body: unknown): Record<string, unknown> =>
+    typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+
+  const applyHolderStatus = (vlinkId: string, leaseId: string, result: cappoRelay.RelayResult) => {
+    const body = relayBody(result.body);
+    if (result.status !== 401) return;
+    if (body.error === "HOLDER_CREDENTIAL_REVOKED") registry.updateLease(vlinkId, leaseId, { status: "terminated" });
+    if (body.error === "HOLDER_CREDENTIAL_EXPIRED") registry.updateLease(vlinkId, leaseId, { status: "expired" });
+  };
+
+  app.post("/api/v1/vlinks/:vlinkId/leases", (req, res) => {
+    const vlink = registry.get(req.params.vlinkId);
+    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    if (!requireEnrollmentGrant(req, res, vlink.vlinkId)) return;
+    if (!leaseSealer) return res.status(503).json({ error: "lease_sealing_unconfigured" });
+
+    const body = req.body ?? {};
+    const required = ["mountId", "tokenId", "nonce", "holderCredential", "packageRef", "workspace", "project", "targetRef", "expiresAt"];
+    const actionScope = (value: unknown): value is string[] =>
+      Array.isArray(value) && value.every((action) => typeof action === "string" && action.trim().length > 0);
+    if (
+      required.some((field) => typeof body[field] !== "string" || !body[field].trim()) ||
+      !actionScope(body.allowedActions) ||
+      !actionScope(body.blockedActions)
+    ) {
+      return res.status(400).json({ error: "invalid_lease_request" });
+    }
+    if (!body.holderCredential.startsWith(`vlm_${body.mountId}.`) || Number.isNaN(Date.parse(body.expiresAt))) {
+      return res.status(400).json({ error: "invalid_lease_request" });
+    }
+    const lease = registry.bindLease(vlink.vlinkId, body);
+    if (!lease) return res.status(503).json({ error: "lease_sealing_unconfigured" });
+    res.status(201).json({ lease });
+  });
+
+  app.get("/api/v1/vlinks/:vlinkId/leases", (req, res) => {
+    if (!registry.get(req.params.vlinkId)) return res.status(404).json({ error: "vlink_not_found" });
+    if (!requireLeaseHuman(req, res, req.params.vlinkId)) return;
+    res.json({ leases: registry.listLeases(req.params.vlinkId) });
+  });
+
+  app.get("/api/v1/vlinks/:vlinkId/leases/:leaseId", (req, res) => {
+    if (!registry.get(req.params.vlinkId)) return res.status(404).json({ error: "vlink_not_found" });
+    if (!requireLeaseEither(req, res, req.params.vlinkId)) return;
+    const lease = registry.getLease(req.params.vlinkId, req.params.leaseId);
+    if (!lease) return res.status(404).json({ error: "lease_not_found" });
+    res.json({ lease });
+  });
+
+  app.post("/api/v1/vlinks/:vlinkId/leases/:leaseId/revoke", async (req, res) => {
+    const vlink = registry.get(req.params.vlinkId);
+    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    if (!requireLeaseHuman(req, res, vlink.vlinkId)) return;
+    const lease = registry.getLease(vlink.vlinkId, req.params.leaseId);
+    const secret = registry.leaseSecret(vlink.vlinkId, req.params.leaseId);
+    if (!lease || !secret) return res.status(404).json({ error: "lease_not_found" });
+    const cappo = await cappoRelay.terminate(lease.mountId, secret.holderCredential, {
+      token_id: secret.tokenId,
+      nonce: secret.nonce,
+    });
+    const cappoBody = relayBody(cappo.body);
+    const alreadyRevoked = cappo.status === 401 && cappoBody.error === "HOLDER_CREDENTIAL_REVOKED";
+    if ((cappo.status >= 200 && cappo.status < 300) || alreadyRevoked) {
+      const updated = registry.updateLease(vlink.vlinkId, lease.leaseId, { status: "terminated" })!;
+      leaseActivity(vlink.vlinkId, vlink, "/api/v1/vlinks/:vlinkId/leases/:leaseId/revoke", "POST", "completed", {
+        cappoStatus: cappo.status,
+        cappoDecision: cappoBody.decision ?? null,
+      });
+      return res.json({ lease: updated, cappo });
+    }
+    applyHolderStatus(vlink.vlinkId, lease.leaseId, cappo);
+    const updated = registry.getLease(vlink.vlinkId, lease.leaseId)!;
+    leaseActivity(vlink.vlinkId, vlink, "/api/v1/vlinks/:vlinkId/leases/:leaseId/revoke", "POST", "failed", {
+      cappoStatus: cappo.status,
+      cappoDecision: cappoBody.decision ?? null,
+    });
+    res.status(cappo.status).json({ lease: updated, cappo });
+  });
+
+  app.post("/api/v1/vlinks/:vlinkId/leases/:leaseId/actions", async (req, res) => {
+    const vlink = registry.get(req.params.vlinkId);
+    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    if (!requireAccess(req, res, vlink.vlinkId)) return;
+    const lease = registry.getLease(vlink.vlinkId, req.params.leaseId);
+    const secret = registry.leaseSecret(vlink.vlinkId, req.params.leaseId);
+    if (!lease || !secret) return res.status(404).json({ error: "lease_not_found" });
+    if (typeof req.body?.action !== "string" || typeof req.body?.resource !== "string") {
+      return res.status(400).json({ error: "invalid_action_request" });
+    }
+    const cappo = await cappoRelay.evaluateAction(lease.mountId, secret.holderCredential, {
+      token_id: secret.tokenId,
+      nonce: secret.nonce,
+      action: req.body.action,
+      resource: req.body.resource,
+    });
+    const body = relayBody(cappo.body);
+    if (body.decision === "allow" || body.decision === "deny") {
+      registry.updateLease(vlink.vlinkId, lease.leaseId, {
+        lastDecision: {
+          action: req.body.action,
+          decision: body.decision,
+          reason: typeof body.reason === "string" ? body.reason : "",
+          at: new Date().toISOString(),
+        },
+      });
+    }
+    applyHolderStatus(vlink.vlinkId, lease.leaseId, cappo);
+    const updated = registry.getLease(vlink.vlinkId, lease.leaseId)!;
+    leaseActivity(vlink.vlinkId, vlink, "/api/v1/vlinks/:vlinkId/leases/:leaseId/actions", "POST", cappo.status >= 200 && cappo.status < 300 ? "completed" : "failed", {
+      cappoDecision: body.decision ?? null,
+    });
+    res.status(cappo.status).json({ lease: updated, cappo });
+  });
+
+  app.post("/api/v1/vlinks/:vlinkId/leases/:leaseId/execute", async (req, res) => {
+    const vlink = registry.get(req.params.vlinkId);
+    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    if (!requireAccess(req, res, vlink.vlinkId)) return;
+    const lease = registry.getLease(vlink.vlinkId, req.params.leaseId);
+    const secret = registry.leaseSecret(vlink.vlinkId, req.params.leaseId);
+    if (!lease || !secret) return res.status(404).json({ error: "lease_not_found" });
+    if (typeof req.body?.action !== "string" || typeof req.body?.resource !== "string") {
+      return res.status(400).json({ error: "invalid_execute_request" });
+    }
+    const cappo = await cappoRelay.execute(lease.mountId, secret.holderCredential, {
+      token_id: secret.tokenId,
+      nonce: secret.nonce,
+      action: req.body.action,
+      target_ref: lease.targetRef,
+      resource: req.body.resource,
+      arguments: req.body.arguments,
+      ...(typeof req.body.operation_id === "string" ? { operation_id: req.body.operation_id } : {}),
+    });
+    const body = relayBody(cappo.body);
+    const decision = body.decision;
+    const patch =
+      decision === "allow" || decision === "deny"
+        ? {
+            lastDecision: {
+              action: req.body.action,
+              decision,
+              reason: typeof body.reason === "string" ? body.reason : "",
+              at: new Date().toISOString(),
+            },
+            ...(decision === "allow" ? { status: "terminated" as const } : {}),
+          }
+        : {};
+    if (Object.keys(patch).length > 0) registry.updateLease(vlink.vlinkId, lease.leaseId, patch);
+    applyHolderStatus(vlink.vlinkId, lease.leaseId, cappo);
+    const updated = registry.getLease(vlink.vlinkId, lease.leaseId)!;
+    leaseActivity(vlink.vlinkId, vlink, "/api/v1/vlinks/:vlinkId/leases/:leaseId/execute", "POST", cappo.status >= 200 && cappo.status < 300 ? "completed" : "failed", {
+      cappoDecision: decision ?? null,
+      anchoring: body.anchoring ?? null,
+      receiptContentHash: relayBody(body.receipt).content_hash ?? null,
+      evidenceType: "cappo-governed-consequence",
+    });
+    res.status(cappo.status).json({ lease: updated, cappo });
+  });
+
+  app.get("/api/v1/vlinks/:vlinkId/leases/:leaseId/state", async (req, res) => {
+    const vlink = registry.get(req.params.vlinkId);
+    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    const credential = requireAccess(req, res, vlink.vlinkId);
+    if (!credential) return;
+    const lease = registry.getLease(vlink.vlinkId, req.params.leaseId);
+    const secret = registry.leaseSecret(vlink.vlinkId, req.params.leaseId);
+    if (!lease || !secret) return res.status(404).json({ error: "lease_not_found" });
+    const resource = typeof req.query.resource === "string" ? req.query.resource : "";
+    if (!resource) return res.status(400).json({ error: "resource_required" });
+    const cappo = await cappoRelay.readState(lease.mountId, secret.holderCredential, lease.targetRef, resource);
+    applyHolderStatus(vlink.vlinkId, lease.leaseId, cappo);
+    const updated = registry.getLease(vlink.vlinkId, lease.leaseId)!;
+    res.status(cappo.status).json({ lease: updated, cappo });
   });
 
   app.post("/api/v1/vlinks/:vlinkId/access-test", (req, res) => {

@@ -136,6 +136,17 @@ VLINK_STATE_PATH=.runtime/vlink-state.json
 
 Production mode requires a non-empty `VLINK_STATE_PATH`.
 
+Governed capability leases additionally require:
+
+```text
+VLINK_LEASE_SEALING_KEY=<32-byte base64 or 64-character hex key>
+VLINK_CAPI_BASE_URL=http://capi.example.internal:3003
+```
+
+The lease sealing key is used only for local AES-256-GCM protection of CAPPO
+holder credentials. VLink forwards those credentials only to the configured
+cAPI Interlink boundary.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -154,6 +165,8 @@ Production mode requires a non-empty `VLINK_STATE_PATH`.
 | `GEMINI_MODEL` | Gemini model identifier used for live execution. |
 | `VLINK_ENABLE_DEMO_RESPONSES` | Set `true` only for deliberately labeled demo chat responses. Defaults off. |
 | `VLINK_ALLOWED_TARGET_HOSTS` | Comma-separated hostname allowlist for custom and failover targets. |
+| `VLINK_LEASE_SEALING_KEY` | AES-256-GCM key for sealed CAPPO holder credentials: 32-byte base64 or 64-character hex. |
+| `VLINK_CAPI_BASE_URL` | Base URL for the cAPI Interlink service used by governed lease relays. |
 
 ## Connection protocol
 
