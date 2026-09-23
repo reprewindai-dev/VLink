@@ -18,6 +18,7 @@ const registry = statePath ? new FileBackedVLinkRegistry({ statePath }) : undefi
 const { app, registry: activeRegistry } = createApp({
   registry,
   publicOrigin: process.env.VLINK_PUBLIC_ORIGIN,
+  pairingOrigin: process.env.VLINK_PAIRING_ORIGIN,
 });
 installReceiptSupport(app, activeRegistry, { privateKeyPem: process.env.VLINK_RECEIPT_PRIVATE_KEY_PEM });
 installFailoverSupport(app, activeRegistry, { timeoutMs: Number(process.env.VLINK_FAILOVER_TIMEOUT_MS ?? 4_000) });
