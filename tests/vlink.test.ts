@@ -163,6 +163,73 @@ test("VLink creation returns a short-lived enrollment grant but does not put it 
 });
 
 
+test("production workspace auth binds VLink to LockerPhycer workspace and ignores forged workspaceId", async () => {
+  const isolated = createApp({
+    allowUnauthenticatedCreate: false,
+    workspaceAuthenticator: async (token) =>
+      token === "workspace-session"
+        ? { userId: "user-1", email: "user@example.com", workspaceId: "ws-canonical" }
+        : undefined,
+  });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    const response = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer workspace-session",
+      },
+      body: JSON.stringify({
+        workspaceId: "ws-forged",
+        environment: "production",
+        displayName: "Workspace-bound",
+        sourceType: "ai-client",
+      }),
+    });
+    assert.equal(response.status, 201);
+    const body = (await response.json()) as { vlink: { workspaceId: string } };
+    assert.equal(body.vlink.workspaceId, "ws-canonical");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
+test("production workspace auth rejects invalid bearer and unbound sessions", async () => {
+  const isolated = createApp({
+    allowUnauthenticatedCreate: false,
+    workspaceAuthenticator: async (token) => {
+      if (token === "unbound-session") throw new Error("LockerPhycer session is authenticated but is not bound to a workspace");
+      return undefined;
+    },
+  });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    const invalid = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer bad-session" },
+      body: JSON.stringify({ workspaceId: "ws", environment: "production", displayName: "blocked", sourceType: "ai-client" }),
+    });
+    assert.equal(invalid.status, 401);
+    assert.equal(((await invalid.json()) as { error: string }).error, "invalid_workspace_session");
+
+    const unbound = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer unbound-session" },
+      body: JSON.stringify({ workspaceId: "ws", environment: "production", displayName: "blocked", sourceType: "ai-client" }),
+    });
+    assert.equal(unbound.status, 409);
+    assert.equal(((await unbound.json()) as { error: string }).error, "workspace_binding_required");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
 test("production-style configuration refuses unauthenticated VLink creation", async () => {
   const isolated = createApp({ allowUnauthenticatedCreate: false });
   const isolatedServer = isolated.app.listen(0, "127.0.0.1");
