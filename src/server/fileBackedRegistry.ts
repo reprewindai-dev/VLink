@@ -23,6 +23,10 @@ import type {
   VLinkRecord,
 } from "../types/vlink";
 import {
+  type DeviceAuthorizationInput,
+  type DeviceAuthorizationPoll,
+  type DeviceAuthorizationStart,
+  type DeviceAuthorizationView,
   InMemoryVLinkRegistry,
   type CreateVLinkInput,
   type VLinkRegistry,
@@ -49,6 +53,30 @@ export class FileBackedVLinkRegistry implements VLinkRegistry {
 
   create(input: CreateVLinkInput, origin: string): VLinkRecord {
     return this.commit(() => this.inner.create(input, origin));
+  }
+
+  configureDeviceAuthorizationEncryptionKey(secret: string | null): void {
+    this.inner.configureDeviceAuthorizationEncryptionKey(secret);
+  }
+
+  startDeviceAuthorization(input: DeviceAuthorizationInput, verificationUri: string, ttlSeconds?: number, intervalSeconds?: number, now?: Date): DeviceAuthorizationStart {
+    return this.commit(() => this.inner.startDeviceAuthorization(input, verificationUri, ttlSeconds, intervalSeconds, now));
+  }
+
+  getDeviceAuthorization(userCode: string, now?: Date): DeviceAuthorizationView | undefined {
+    return this.commit(() => this.inner.getDeviceAuthorization(userCode, now));
+  }
+
+  approveDeviceAuthorization(userCode: string, workspaceId: string, operatorId: string, origin: string, credentialTtlSeconds?: number, now?: Date): DeviceAuthorizationView | undefined {
+    return this.commit(() => this.inner.approveDeviceAuthorization(userCode, workspaceId, operatorId, origin, credentialTtlSeconds, now));
+  }
+
+  denyDeviceAuthorization(userCode: string, workspaceId: string, operatorId: string, now?: Date): DeviceAuthorizationView | undefined {
+    return this.commit(() => this.inner.denyDeviceAuthorization(userCode, workspaceId, operatorId, now));
+  }
+
+  pollDeviceAuthorization(deviceCode: string, now?: Date): DeviceAuthorizationPoll | undefined {
+    return this.commit(() => this.inner.pollDeviceAuthorization(deviceCode, now));
   }
 
   list(): VLinkRecord[] {
@@ -127,11 +155,11 @@ export class FileBackedVLinkRegistry implements VLinkRegistry {
   private commit<T>(operation: () => T): T {
     const before = this.inner.exportSnapshot();
     const beforeJson = stableJson(before);
-    const result = operation();
-    const after = this.inner.exportSnapshot();
-    const afterJson = stableJson(after);
-    if (beforeJson === afterJson) return result;
     try {
+      const result = operation();
+      const after = this.inner.exportSnapshot();
+      const afterJson = stableJson(after);
+      if (beforeJson === afterJson) return result;
       this.persist(afterJson);
       return result;
     } catch (error) {
