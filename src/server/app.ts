@@ -6,6 +6,7 @@ import type { VLinkAccessCredentialSummary, VLinkSourceType } from "../types/vli
 export interface CreateAppOptions {
   registry?: VLinkRegistry;
   publicOrigin?: string;
+  pairingOrigin?: string;
   enableDemoResponses?: boolean;
   allowUnboundCompatibility?: boolean;
   allowUnauthenticatedCreate?: boolean;
@@ -303,7 +304,11 @@ export function createApp(options: CreateAppOptions = {}) {
     if (!requireEnrollmentGrant(req, res, req.params.vlinkId)) return;
 
     const ttlSeconds = clampSeconds(Number(req.body?.ttlSeconds ?? 600), 600, 900);
-    const pairing = registry.createPairing(req.params.vlinkId, originFor(req, options.publicOrigin), ttlSeconds);
+    const pairing = registry.createPairing(
+      req.params.vlinkId,
+      originFor(req, options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || options.publicOrigin),
+      ttlSeconds,
+    );
     if (!pairing) return res.status(404).json({ error: "vlink_not_found" });
     res.setHeader("Cache-Control", "no-store");
     res.status(201).json({ pairing });
@@ -316,7 +321,22 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ pairing });
   });
 
-  const approvePairing = (req: Request, res: Response) => {
+  const approvePairing = async (req: Request, res: Response) => {
+    const vlink = registry.get(req.params.vlinkId);
+    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    const token = getBearerToken(req);
+    if (!token || token.startsWith("vle_") || token.startsWith("vlt_")) {
+      res.setHeader("WWW-Authenticate", 'Bearer realm="VLink workspace approval"');
+      return res.status(401).json({ error: "workspace_session_required" });
+    }
+    let workspaceAuthorized = false;
+    try {
+      workspaceAuthorized = await authorizeWorkspace(token, vlink.workspaceId);
+    } catch {
+      return res.status(503).json({ error: "workspace_authority_unavailable" });
+    }
+    if (!workspaceAuthorized) return res.status(403).json({ error: "workspace_access_denied" });
+
     const approvalCode = String(req.body?.approvalCode ?? req.body?.oneTimeCode ?? "");
     const approved = registry.approvePairing(req.params.vlinkId, req.params.pairingId, approvalCode);
     if (!approved) {

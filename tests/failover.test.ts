@@ -54,10 +54,13 @@ const backendHandler = (role: "primary" | "secondary") => (req: IncomingMessage,
 
 const primaryServer = createServer(backendHandler("primary"));
 const secondaryServer = createServer(backendHandler("secondary"));
+const TEST_OWNER_TOKEN = "test-owner-ws-failover";
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({
   registry,
   publicOrigin: "https://connect.example.test",
+  pairingOrigin: "https://app.example.test",
+  authorizeWorkspace: async (token, workspaceId) => token === TEST_OWNER_TOKEN && workspaceId === "ws-failover",
   enableDemoResponses: true,
   accessTokenTtlSeconds: 3600,
   enrollmentGrantTtlSeconds: 900,
@@ -142,7 +145,7 @@ async function createCredential(): Promise<{ created: Created; credential: Crede
 
   const approve = await fetch(`${appBase}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.pairing.approvalCode }),
   });
   assert.equal(approve.status, 200);

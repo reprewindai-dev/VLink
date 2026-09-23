@@ -274,6 +274,8 @@ export default function App() {
   const copy = (text: string) => navigator.clipboard?.writeText(text);
 
   if (pairingTarget) {
+    const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    const loginHref = `/login?returnTo=${encodeURIComponent(returnTo)}`;
     return (
       <main className="shell">
         <section className="hero">
@@ -287,8 +289,12 @@ export default function App() {
           <div className="statusRow"><code>{pairingTarget.vlinkId}</code><code>{pairingTarget.pairingId}</code></div>
           {pairingInfo?.expiresAt && <p>Expires at {new Date(pairingInfo.expiresAt).toLocaleString()}.</p>}
           {!pairingTarget.approvalCode && <div className="error">This page has no one-time approval code. Open it from the VLink QR code.</div>}
+          {workspaceState === "loading" && <p>Checking your Veklom identity and workspace…</p>}
+          {workspaceState === "signed-out" && <div className="error">Sign in with the Veklom account that owns this workspace before approving. <a href={loginHref}>Sign in to Veklom</a></div>}
+          {workspaceState === "missing" && <div className="error">This identity has no owned workspace to authorize the pairing.</div>}
+          {workspaceState === "failed" && <div className="error">Your workspace could not be verified. Pairing approval is unavailable until the identity authority responds.</div>}
           {pairingApproval === "approved" ? <div className="truthBadge"><CheckCircle2 size={16}/> Approved. Return to the initiating device; it can now exchange its separate device code for temporary access.</div> :
-            <button className="primary" disabled={busy || !pairingTarget.approvalCode || pairingInfo?.status === "expired"} onClick={approvePairing}>
+            workspaceState === "ready" && <button className="primary" disabled={busy || !pairingTarget.approvalCode || pairingInfo?.status === "expired"} onClick={approvePairing}>
               <ShieldCheck size={17}/> {busy ? "Approving…" : "Approve pairing"}
             </button>}
           {pairingApproval === "failed" && error && <div className="error">{error}</div>}

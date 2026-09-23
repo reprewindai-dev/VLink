@@ -9,10 +9,18 @@ import { installReceiptSupport } from "../src/server/receiptSupport";
 import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
 import type { VLinkSignedReceipt } from "../src/types/vlink";
 
+const TEST_OWNER_TOKEN = "test-owner-ws-test";
+const TEST_WRONG_OWNER_TOKEN = "test-owner-ws-other";
+const testWorkspaceByToken = new Map([
+  [TEST_OWNER_TOKEN, "ws-test"],
+  [TEST_WRONG_OWNER_TOKEN, "ws-other"],
+]);
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({
   registry,
   publicOrigin: "https://connect.example.test",
+  pairingOrigin: "https://app.example.test",
+  authorizeWorkspace: async (token, workspaceId) => testWorkspaceByToken.get(token) === workspaceId,
   enableDemoResponses: true,
   accessTokenTtlSeconds: 3600,
   enrollmentGrantTtlSeconds: 900,
@@ -105,7 +113,7 @@ async function approveAndExchange(created: CreatedVLink): Promise<{ pairing: Pai
   const pairing = await createPairing(created);
   const approve = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   assert.equal(approve.status, 200);
@@ -305,6 +313,38 @@ test("pairing creation requires the enrollment grant", async () => {
 });
 
 
+test("pairing approval requires the authenticated owner of the VLink workspace", async () => {
+  const created = await createVLink();
+  const pairing = await createPairing(created);
+  assert.equal(new URL(pairing.pairingUrl).origin, "https://app.example.test");
+  assert.equal(new URL(created.vlink.endpoints.openaiCompatibleBaseUrl).origin, "https://connect.example.test");
+
+  const approve = (authorization?: string) => fetch(
+    `${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) },
+      body: JSON.stringify({ approvalCode: pairing.approvalCode }),
+    },
+  );
+
+  const anonymous = await approve();
+  assert.equal(anonymous.status, 401);
+  assert.equal(((await anonymous.json()) as { error: string }).error, "workspace_session_required");
+
+  const wrongOwner = await approve(`Bearer ${TEST_WRONG_OWNER_TOKEN}`);
+  assert.equal(wrongOwner.status, 403);
+  assert.equal(((await wrongOwner.json()) as { error: string }).error, "workspace_access_denied");
+
+  const pending = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}`);
+  assert.equal(((await pending.json()) as { pairing: { status: string } }).pairing.status, "pending");
+
+  const owner = await approve(`Bearer ${TEST_OWNER_TOKEN}`);
+  assert.equal(owner.status, 200);
+  assert.equal(((await owner.json()) as { pairing: { status: string } }).pairing.status, "approved");
+});
+
+
 test("an enrollment grant is bound to one VLink", async () => {
   const first = await createVLink();
   const second = await createVLink();
@@ -365,7 +405,7 @@ test("browser approval is one-time and does not itself mint a workload credentia
   const pairing = await createPairing(created);
   const approve = () => fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   const first = await approve();
@@ -381,7 +421,7 @@ test("wrong device code cannot exchange an approved pairing", async () => {
   const pairing = await createPairing(created);
   await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
@@ -399,7 +439,7 @@ test("approved pairing exchanges exactly once for an opaque temporary VLink acce
   const pairing = await createPairing(created);
   await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   const exchange = () => fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
