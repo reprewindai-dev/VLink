@@ -35,7 +35,7 @@ const backendHandler = (role: "primary" | "secondary") => (req: IncomingMessage,
       if (res.destroyed || res.writableEnded) return;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ backend: role, delayed: true }));
-    }, 120);
+    }, 600);
     return;
   }
   if (mode === "server_error") {
@@ -63,7 +63,7 @@ const { app } = createApp({
   enrollmentGrantTtlSeconds: 900,
 });
 const receiptSupport = installReceiptSupport(app, registry);
-installFailoverSupport(app, registry, { timeoutMs: 30 });
+installFailoverSupport(app, registry, { timeoutMs: 500 });
 app.get("*", (_req, res) => res.status(200).type("text/plain").send("ui-fallback"));
 
 let appBase = "";
