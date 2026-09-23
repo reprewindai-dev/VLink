@@ -141,8 +141,10 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
+      const sessionToken = window.localStorage.getItem("veklom.access_token")?.trim();
       const result = await api<{ vlink: VLinkRecord; enrollmentGrant: VLinkEnrollmentGrant }>("/api/v1/vlinks", {
         method: "POST",
+        ...(sessionToken ? { headers: bearer(sessionToken) } : {}),
         body: JSON.stringify({ workspaceId, environment, displayName, sourceType }),
       });
       setVlink(result.vlink);
