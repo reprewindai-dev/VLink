@@ -35,7 +35,7 @@ const backendHandler = (role: "primary" | "secondary") => (req: IncomingMessage,
       if (res.destroyed || res.writableEnded) return;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ backend: role, delayed: true }));
-    }, 120);
+    }, 600);
     return;
   }
   if (mode === "server_error") {
@@ -54,16 +54,19 @@ const backendHandler = (role: "primary" | "secondary") => (req: IncomingMessage,
 
 const primaryServer = createServer(backendHandler("primary"));
 const secondaryServer = createServer(backendHandler("secondary"));
+const TEST_OWNER_TOKEN = "test-owner-ws-failover";
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({
   registry,
   publicOrigin: "https://connect.example.test",
+  pairingOrigin: "https://app.example.test",
+  workspaceAuthenticator: async (token) => token === TEST_OWNER_TOKEN ? { workspaceId: "ws-failover" } : undefined,
   enableDemoResponses: true,
   accessTokenTtlSeconds: 3600,
   enrollmentGrantTtlSeconds: 900,
 });
 const receiptSupport = installReceiptSupport(app, registry);
-installFailoverSupport(app, registry, { timeoutMs: 30 });
+installFailoverSupport(app, registry, { timeoutMs: 500 });
 app.get("*", (_req, res) => res.status(200).type("text/plain").send("ui-fallback"));
 
 let appBase = "";
@@ -142,7 +145,7 @@ async function createCredential(): Promise<{ created: Created; credential: Crede
 
   const approve = await fetch(`${appBase}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.pairing.approvalCode }),
   });
   assert.equal(approve.status, 200);

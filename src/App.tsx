@@ -32,6 +32,8 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
 };
 
 const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+const accountToken = () => window.localStorage.getItem("veklom.access_token")?.trim() || "";
+const PENDING_APPROVAL_KEY = "veklom.vlink.pending_pairing_approval";
 
 export default function App() {
   const [displayName, setDisplayName] = useState("My first VLink");
@@ -54,9 +56,28 @@ export default function App() {
   const pairingTarget = useMemo(() => {
     const match = window.location.pathname.match(/^\/pair\/([^/]+)\/([^/]+)$/);
     if (!match) return null;
+    const vlinkId = decodeURIComponent(match[1]);
+    const pairingId = decodeURIComponent(match[2]);
     const approvalCode = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("approval");
-    return { vlinkId: decodeURIComponent(match[1]), pairingId: decodeURIComponent(match[2]), approvalCode };
+    if (approvalCode) return { vlinkId, pairingId, approvalCode };
+    try {
+      const pending = JSON.parse(window.sessionStorage.getItem(PENDING_APPROVAL_KEY) || "null") as
+        | { vlinkId?: string; pairingId?: string; approvalCode?: string }
+        | null;
+      if (pending?.vlinkId === vlinkId && pending.pairingId === pairingId && pending.approvalCode) {
+        return { vlinkId, pairingId, approvalCode: pending.approvalCode };
+      }
+    } catch {
+      window.sessionStorage.removeItem(PENDING_APPROVAL_KEY);
+    }
+    return { vlinkId, pairingId, approvalCode: null };
   }, []);
+
+  useEffect(() => {
+    if (!pairingTarget?.approvalCode) return;
+    window.sessionStorage.setItem(PENDING_APPROVAL_KEY, JSON.stringify(pairingTarget));
+    if (window.location.hash) window.history.replaceState({}, "", `${window.location.pathname}${window.location.search}`);
+  }, [pairingTarget]);
 
   useEffect(() => {
     if (!pairing?.qrPayload) {
@@ -141,8 +162,10 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
+      const sessionToken = window.localStorage.getItem("veklom.access_token")?.trim();
       const result = await api<{ vlink: VLinkRecord; enrollmentGrant: VLinkEnrollmentGrant }>("/api/v1/vlinks", {
         method: "POST",
+        ...(sessionToken ? { headers: bearer(sessionToken) } : {}),
         body: JSON.stringify({ workspaceId, environment, displayName, sourceType }),
       });
       setVlink(result.vlink);
@@ -207,15 +230,21 @@ export default function App() {
 
   const approvePairing = async () => {
     if (!pairingTarget?.approvalCode) return;
+    const sessionToken = accountToken();
+    if (!sessionToken) {
+      setError("Sign in with the workspace-owning Veklom account before approving this pairing.");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
       await api(`/api/v1/vlinks/${pairingTarget.vlinkId}/pairing/${pairingTarget.pairingId}/approve`, {
         method: "POST",
+        headers: bearer(sessionToken),
         body: JSON.stringify({ approvalCode: pairingTarget.approvalCode }),
       });
       setPairingApproval("approved");
-      window.history.replaceState({}, "", window.location.pathname);
+      window.sessionStorage.removeItem(PENDING_APPROVAL_KEY);
     } catch (e) {
       setPairingApproval("failed");
       setError(e instanceof Error ? e.message : "Pairing approval failed");
@@ -248,6 +277,9 @@ export default function App() {
   const copy = (text: string) => navigator.clipboard?.writeText(text);
 
   if (pairingTarget) {
+    const signedIn = Boolean(accountToken());
+    const returnTo = `${window.location.pathname}${window.location.search}`;
+    const loginHref = `/login?returnTo=${encodeURIComponent(returnTo)}`;
     return (
       <main className="shell">
         <section className="hero">
@@ -261,8 +293,9 @@ export default function App() {
           <div className="statusRow"><code>{pairingTarget.vlinkId}</code><code>{pairingTarget.pairingId}</code></div>
           {pairingInfo?.expiresAt && <p>Expires at {new Date(pairingInfo.expiresAt).toLocaleString()}.</p>}
           {!pairingTarget.approvalCode && <div className="error">This page has no one-time approval code. Open it from the VLink QR code.</div>}
+          {!signedIn && <div className="error">Sign in with the Veklom account that owns this workspace before approving. <a href={loginHref}>Sign in to Veklom</a></div>}
           {pairingApproval === "approved" ? <div className="truthBadge"><CheckCircle2 size={16}/> Approved. Return to the initiating device; it can now exchange its separate device code for temporary access.</div> :
-            <button className="primary" disabled={busy || !pairingTarget.approvalCode || pairingInfo?.status === "expired"} onClick={approvePairing}>
+            signedIn && <button className="primary" disabled={busy || !pairingTarget.approvalCode || pairingInfo?.status === "expired"} onClick={approvePairing}>
               <ShieldCheck size={17}/> {busy ? "Approving…" : "Approve pairing"}
             </button>}
           {pairingApproval === "failed" && error && <div className="error">{error}</div>}

@@ -9,10 +9,18 @@ import { installReceiptSupport } from "../src/server/receiptSupport";
 import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
 import type { VLinkSignedReceipt } from "../src/types/vlink";
 
+const TEST_OWNER_TOKEN = "test-owner-ws-test";
+const TEST_OTHER_OWNER_TOKEN = "test-owner-ws-other";
 const registry = new InMemoryVLinkRegistry();
 const { app } = createApp({
   registry,
   publicOrigin: "https://connect.example.test",
+  pairingOrigin: "https://app.example.test",
+  workspaceAuthenticator: async (token) => {
+    if (token === TEST_OWNER_TOKEN) return { workspaceId: "ws-test" };
+    if (token === TEST_OTHER_OWNER_TOKEN) return { workspaceId: "ws-other" };
+    return undefined;
+  },
   enableDemoResponses: true,
   accessTokenTtlSeconds: 3600,
   enrollmentGrantTtlSeconds: 900,
@@ -105,7 +113,7 @@ async function approveAndExchange(created: CreatedVLink): Promise<{ pairing: Pai
   const pairing = await createPairing(created);
   const approve = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   assert.equal(approve.status, 200);
@@ -163,6 +171,73 @@ test("VLink creation returns a short-lived enrollment grant but does not put it 
 });
 
 
+test("production workspace auth binds VLink to LockerPhycer workspace and ignores forged workspaceId", async () => {
+  const isolated = createApp({
+    allowUnauthenticatedCreate: false,
+    workspaceAuthenticator: async (token) =>
+      token === "workspace-session"
+        ? { userId: "user-1", email: "user@example.com", workspaceId: "ws-canonical" }
+        : undefined,
+  });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    const response = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer workspace-session",
+      },
+      body: JSON.stringify({
+        workspaceId: "ws-forged",
+        environment: "production",
+        displayName: "Workspace-bound",
+        sourceType: "ai-client",
+      }),
+    });
+    assert.equal(response.status, 201);
+    const body = (await response.json()) as { vlink: { workspaceId: string } };
+    assert.equal(body.vlink.workspaceId, "ws-canonical");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
+test("production workspace auth rejects invalid bearer and unbound sessions", async () => {
+  const isolated = createApp({
+    allowUnauthenticatedCreate: false,
+    workspaceAuthenticator: async (token) => {
+      if (token === "unbound-session") throw new Error("LockerPhycer session is authenticated but is not bound to a workspace");
+      return undefined;
+    },
+  });
+  const isolatedServer = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => isolatedServer.once("listening", () => resolve()));
+  const isolatedBase = `http://127.0.0.1:${(isolatedServer.address() as AddressInfo).port}`;
+  try {
+    const invalid = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer bad-session" },
+      body: JSON.stringify({ workspaceId: "ws", environment: "production", displayName: "blocked", sourceType: "ai-client" }),
+    });
+    assert.equal(invalid.status, 401);
+    assert.equal(((await invalid.json()) as { error: string }).error, "invalid_workspace_session");
+
+    const unbound = await fetch(`${isolatedBase}/api/v1/vlinks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer unbound-session" },
+      body: JSON.stringify({ workspaceId: "ws", environment: "production", displayName: "blocked", sourceType: "ai-client" }),
+    });
+    assert.equal(unbound.status, 409);
+    assert.equal(((await unbound.json()) as { error: string }).error, "workspace_binding_required");
+  } finally {
+    await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+
 test("production-style configuration refuses unauthenticated VLink creation", async () => {
   const isolated = createApp({ allowUnauthenticatedCreate: false });
   const isolatedServer = isolated.app.listen(0, "127.0.0.1");
@@ -174,7 +249,7 @@ test("production-style configuration refuses unauthenticated VLink creation", as
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workspaceId: "ws", environment: "production", displayName: "blocked", sourceType: "ai-client" }),
     });
-    assert.equal(response.status, 403);
+    assert.equal(response.status, 401);
     assert.equal(((await response.json()) as { error: string }).error, "workspace_auth_required");
   } finally {
     await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
@@ -207,6 +282,38 @@ test("pairing creation requires the enrollment grant", async () => {
   });
   assert.equal(response.status, 401);
   assert.equal(((await response.json()) as { error: string }).error, "enrollment_grant_required");
+});
+
+
+test("pairing approval requires the authenticated LockerPhycer owner of the VLink workspace", async () => {
+  const created = await createVLink();
+  const pairing = await createPairing(created);
+  assert.equal(new URL(pairing.pairingUrl).origin, "https://app.example.test");
+  assert.equal(new URL(created.vlink.endpoints.openaiCompatibleBaseUrl).origin, "https://connect.example.test");
+
+  const approve = (authorization?: string) => fetch(
+    `${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) },
+      body: JSON.stringify({ approvalCode: pairing.approvalCode }),
+    },
+  );
+
+  const anonymous = await approve();
+  assert.equal(anonymous.status, 401);
+  assert.equal(((await anonymous.json()) as { error: string }).error, "workspace_session_required");
+
+  const wrongWorkspace = await approve(`Bearer ${TEST_OTHER_OWNER_TOKEN}`);
+  assert.equal(wrongWorkspace.status, 403);
+  assert.equal(((await wrongWorkspace.json()) as { error: string }).error, "workspace_access_denied");
+
+  const pending = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}`);
+  assert.equal(((await pending.json()) as { pairing: { status: string } }).pairing.status, "pending");
+
+  const owner = await approve(`Bearer ${TEST_OWNER_TOKEN}`);
+  assert.equal(owner.status, 200);
+  assert.equal(((await owner.json()) as { pairing: { status: string } }).pairing.status, "approved");
 });
 
 
@@ -270,7 +377,7 @@ test("browser approval is one-time and does not itself mint a workload credentia
   const pairing = await createPairing(created);
   const approve = () => fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   const first = await approve();
@@ -286,7 +393,7 @@ test("wrong device code cannot exchange an approved pairing", async () => {
   const pairing = await createPairing(created);
   await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   const response = await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
@@ -304,7 +411,7 @@ test("approved pairing exchanges exactly once for an opaque temporary VLink acce
   const pairing = await createPairing(created);
   await fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
     body: JSON.stringify({ approvalCode: pairing.approvalCode }),
   });
   const exchange = () => fetch(`${base}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairingId}/exchange`, {
