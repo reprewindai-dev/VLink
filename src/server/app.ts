@@ -5,6 +5,14 @@ import { createLeaseSealer } from "./leaseSealer";
 import * as cappoRelay from "./cappoRelay";
 import type { VLinkAccessCredentialSummary, VLinkSourceType } from "../types/vlink";
 
+export interface VLinkWorkspaceIdentity {
+  userId?: string;
+  email?: string;
+  workspaceId: string;
+}
+
+export type VLinkWorkspaceAuthenticator = (token: string) => Promise<VLinkWorkspaceIdentity | undefined>;
+
 export interface CreateAppOptions {
   registry?: VLinkRegistry;
   publicOrigin?: string;
@@ -13,6 +21,8 @@ export interface CreateAppOptions {
   allowUnauthenticatedCreate?: boolean;
   enrollmentGrantTtlSeconds?: number;
   accessTokenTtlSeconds?: number;
+  lockerPhycerBaseUrl?: string;
+  workspaceAuthenticator?: VLinkWorkspaceAuthenticator;
 }
 
 const SOURCE_TYPES = new Set<VLinkSourceType>([
@@ -109,6 +119,40 @@ export function createApp(options: CreateAppOptions = {}) {
     86400,
   );
 
+  const lockerPhycerBaseUrl = (
+    options.lockerPhycerBaseUrl ??
+    process.env.VLINK_LOCKERPHYCER_URL ??
+    process.env.LOCKERPHYCER_URL ??
+    ""
+  ).replace(/\/+$/, "");
+
+  const workspaceAuthenticator: VLinkWorkspaceAuthenticator | undefined =
+    options.workspaceAuthenticator ??
+    (lockerPhycerBaseUrl
+      ? async (token: string) => {
+          const response = await fetch(`${lockerPhycerBaseUrl}/api/v1/auth/me`, {
+            headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+            signal: AbortSignal.timeout(5_000),
+          });
+          if (response.status === 401 || response.status === 403) return undefined;
+          if (!response.ok) throw new Error(`LockerPhycer auth/me returned HTTP ${response.status}`);
+          const identity = (await response.json()) as {
+            id?: string;
+            email?: string;
+            workspace_id?: string | null;
+          };
+          const workspaceId = identity.workspace_id?.trim();
+          if (!workspaceId) {
+            throw new Error("LockerPhycer session is authenticated but is not bound to a workspace");
+          }
+          return {
+            ...(identity.id ? { userId: identity.id } : {}),
+            ...(identity.email ? { email: identity.email } : {}),
+            workspaceId,
+          };
+        }
+      : undefined);
+
   app.disable("x-powered-by");
   app.use(express.json({ limit: "2mb" }));
   app.use(express.urlencoded({ extended: true, limit: "2mb" }));
@@ -199,6 +243,7 @@ export function createApp(options: CreateAppOptions = {}) {
       demoResponsesEnabled: enableDemoResponses,
       unboundCompatibilityEnabled: allowUnboundCompatibility,
       unauthenticatedCreateEnabled: allowUnauthenticatedCreate,
+      workspaceAuthConfigured: Boolean(workspaceAuthenticator),
       persistence: "memory",
       leaseSealing: Boolean(leaseSealer),
       capiConfigured: Boolean(process.env.VLINK_CAPI_BASE_URL?.trim()),
@@ -206,15 +251,51 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.post("/api/v1/vlinks", (req, res) => {
+  app.post("/api/v1/vlinks", async (req, res) => {
+    let { workspaceId, environment, displayName, sourceType, expiresAt } = req.body ?? {};
+
     if (!allowUnauthenticatedCreate) {
-      return res.status(403).json({
-        error: "workspace_auth_required",
-        message: "Unauthenticated VLink creation is disabled in production until workspace/account authentication is integrated.",
-      });
+      const token = getBearerToken(req);
+      if (!token) {
+        res.setHeader("WWW-Authenticate", 'Bearer realm="Veklom workspace"');
+        return res.status(401).json({
+          error: "workspace_auth_required",
+          message: "Authenticate with a LockerPhycer workspace-bound session before creating a VLink.",
+        });
+      }
+      if (!workspaceAuthenticator) {
+        return res.status(503).json({
+          error: "workspace_auth_unconfigured",
+          message: "VLink cannot validate LockerPhycer workspace identity on this deployment.",
+        });
+      }
+
+      let identity: VLinkWorkspaceIdentity | undefined;
+      try {
+        identity = await workspaceAuthenticator(token);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "workspace authentication unavailable";
+        if (message.includes("not bound to a workspace")) {
+          return res.status(409).json({
+            error: "workspace_binding_required",
+            message: "The authenticated LockerPhycer session must be bound to a workspace before VLink creation.",
+          });
+        }
+        return res.status(502).json({
+          error: "workspace_auth_unavailable",
+          message: "VLink could not validate the LockerPhycer session.",
+        });
+      }
+      if (!identity) {
+        res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
+        return res.status(401).json({ error: "invalid_workspace_session" });
+      }
+
+      // The authenticated identity is authoritative. Never trust a caller-supplied
+      // workspaceId over the workspace bound into the LockerPhycer session.
+      workspaceId = identity.workspaceId;
     }
 
-    const { workspaceId, environment, displayName, sourceType, expiresAt } = req.body ?? {};
     if (!workspaceId || !environment || !displayName || !SOURCE_TYPES.has(sourceType)) {
       return res.status(400).json({
         error: "invalid_vlink_request",
@@ -268,7 +349,14 @@ export function createApp(options: CreateAppOptions = {}) {
       service: "VLink",
       createVLink: `${originFor(req, options.publicOrigin)}/api/v1/vlinks`,
       discovery: `${originFor(req, options.publicOrigin)}/.well-known/vlink.json?vlinkId=<vlk_...>`,
-      note: "Discovery manifests contain connection metadata only. Enrollment grants and workload access tokens are never published here.",
+      managementAuth: {
+        scheme: "bearer",
+        authority: "LockerPhycer",
+        login: "https://veklom.com/login",
+        workspaceBootstrap: "https://veklom.com/os/onboarding",
+        authenticatedConnect: "https://veklom.com/vlink/connect/",
+      },
+      note: "Discovery is secret-free. Production VLink creation requires a LockerPhycer workspace-bound session; VLink connection identity is not consequence authority.",
     });
   });
 
