@@ -22,6 +22,10 @@ const sourceOptions: Array<{ value: VLinkSourceType; label: string }> = [
   { value: "container", label: "Docker / Kubernetes workload" },
 ];
 
+const apiOrigin = ["veklom.com", "www.veklom.com"].includes(window.location.hostname)
+  ? "https://vlink.veklom.com"
+  : "";
+
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const headers = new Headers(init?.headers);
   headers.set("content-type", "application/json");
@@ -29,7 +33,7 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
     const accountToken = readAccountToken(window.localStorage);
     if (accountToken) headers.set("authorization", `Bearer ${accountToken}`);
   }
-  const response = await fetch(path, {
+  const response = await fetch(`${apiOrigin}${path}`, {
     ...init,
     headers,
   });
@@ -58,6 +62,15 @@ export default function App() {
   const [exchanging, setExchanging] = useState(false);
   const [pairingInfo, setPairingInfo] = useState<VLinkPairingStatusView | null>(null);
   const [pairingApproval, setPairingApproval] = useState<"idle" | "approved" | "failed">("idle");
+  const [deviceAuthorization, setDeviceAuthorization] = useState<{
+    machineIdentity: { value: string; assurance: "client-asserted" };
+    displayName: string;
+    sourceType: VLinkSourceType;
+    requestedScope: string;
+    status: "pending" | "authorized" | "denied" | "expired";
+    expiresAt: string;
+  } | null>(null);
+  const [deviceAuthorizationDecision, setDeviceAuthorizationDecision] = useState<"idle" | "approved" | "denied" | "failed">("idle");
 
   useEffect(() => {
     const accountToken = readAccountToken(window.localStorage);
@@ -83,6 +96,22 @@ export default function App() {
     const approvalCode = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("approval");
     return { vlinkId: decodeURIComponent(match[1]), pairingId: decodeURIComponent(match[2]), approvalCode };
   }, []);
+
+  const deviceAuthorizationTarget = useMemo(() => {
+    if (!window.location.pathname.endsWith("/authorize")) return null;
+    const userCode = new URLSearchParams(window.location.search).get("user_code");
+    return userCode ? userCode.replace(/[\s-]/g, "").toUpperCase() : "";
+  }, []);
+
+  useEffect(() => {
+    if (!deviceAuthorizationTarget) return;
+    api<{ authorization: NonNullable<typeof deviceAuthorization> }>(
+      `/api/v1/device/authorizations/${encodeURIComponent(deviceAuthorizationTarget)}`,
+    ).then((result) => setDeviceAuthorization(result.authorization)).catch((cause: unknown) => {
+      setDeviceAuthorization(null);
+      setError(cause instanceof Error ? cause.message : "Could not load this authorization request");
+    });
+  }, [deviceAuthorizationTarget]);
 
   useEffect(() => {
     if (!pairing?.qrPayload) {
@@ -250,6 +279,26 @@ export default function App() {
     }
   };
 
+  const decideDeviceAuthorization = async (decision: "approve" | "deny") => {
+    if (!deviceAuthorizationTarget) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<{ authorization: NonNullable<typeof deviceAuthorization> }>(
+        `/api/v1/device/authorizations/${encodeURIComponent(deviceAuthorizationTarget)}/${decision}`,
+        { method: "POST", body: "{}" },
+      );
+      setDeviceAuthorization(result.authorization);
+      setDeviceAuthorizationDecision(decision === "approve" ? "approved" : "denied");
+      window.history.replaceState({}, "", window.location.pathname);
+    } catch (cause) {
+      setDeviceAuthorizationDecision("failed");
+      setError(cause instanceof Error ? cause.message : "Could not update this authorization");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const revokeAccess = async () => {
     if (!vlink || !credential) return;
     setBusy(true);
@@ -298,6 +347,45 @@ export default function App() {
               <ShieldCheck size={17}/> {busy ? "Approving…" : "Approve pairing"}
             </button>}
           {pairingApproval === "failed" && error && <div className="error">{error}</div>}
+        </section>
+      </main>
+    );
+  }
+
+  if (deviceAuthorizationTarget !== null) {
+    const returnTo = `${window.location.pathname}${window.location.search}`;
+    const loginHref = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+    return (
+      <main className="shell">
+        <section className="hero">
+          <div className="brand"><span className="brandMark">V</span><span>VLink</span></div>
+          <h1>Authorize a machine connection.</h1>
+          <p>Review the machine’s declared identity and the narrow VLink connection it is requesting. Approval does not grant CAPPO capability or authority.</p>
+        </section>
+        <section className="card">
+          <div className="eyebrow">MACHINE AUTHORIZATION</div>
+          {!deviceAuthorizationTarget && <div className="error">This authorization link is missing its user code.</div>}
+          {!deviceAuthorization && !error && <p>Loading authorization request…</p>}
+          {deviceAuthorization && <>
+            <h2>{deviceAuthorization.displayName}</h2>
+            <div className="statusRow"><span className="pill observe">{deviceAuthorization.requestedScope}</span><code>{deviceAuthorization.machineIdentity.value}</code></div>
+            <p>Identity assurance: <strong>client-asserted</strong>. This value is supplied by the requesting client; it is not hardware attestation.</p>
+            <p>Requested connection type: <strong>{deviceAuthorization.sourceType}</strong>.</p>
+            <p>Request expires: {new Date(deviceAuthorization.expiresAt).toLocaleString()}.</p>
+            <div className="truthBadge"><ShieldCheck size={16}/> Approval binds this VLink to your authenticated LockerPhycer operator and workspace. It grants VLink connection access only; CAPPO authority is separate.</div>
+            {workspaceState === "loading" && <p>Checking your Veklom identity and workspace…</p>}
+            {workspaceState === "signed-out" && <div className="error">Sign in with your Veklom account before approving. <a href={loginHref}>Sign in to Veklom</a></div>}
+            {workspaceState === "missing" && <div className="error">This identity has no owned workspace to authorize the connection.</div>}
+            {workspaceState === "failed" && <div className="error">Your workspace could not be verified. Authorization is unavailable until identity authority responds.</div>}
+            {deviceAuthorization.status !== "pending" && <p>Request state: <strong>{deviceAuthorization.status}</strong>.</p>}
+            {deviceAuthorizationDecision === "approved" && <div className="truthBadge"><CheckCircle2 size={16}/> Approved. Return to the machine; it can now poll for its VLink-scoped credential.</div>}
+            {deviceAuthorizationDecision === "denied" && <div className="truthBadge">Request denied. No machine access was granted.</div>}
+            {workspaceState === "ready" && deviceAuthorization.status === "pending" && deviceAuthorizationDecision === "idle" && <div className="actions">
+              <button className="primary" disabled={busy} onClick={() => void decideDeviceAuthorization("approve")}><ShieldCheck size={17}/> {busy ? "Saving…" : "Approve VLink access"}</button>
+              <button disabled={busy} onClick={() => void decideDeviceAuthorization("deny")}>Deny</button>
+            </div>}
+          </>}
+          {error && <div className="error">{error}</div>}
         </section>
       </main>
     );

@@ -7,7 +7,7 @@ import { authorizeWorkspaceWithLockerPhycer, createApp } from "../src/server/app
 import { canonicalizeVLinkJson } from "../src/server/receiptSigner";
 import { installReceiptSupport } from "../src/server/receiptSupport";
 import { InMemoryVLinkRegistry } from "../src/server/vlinkRegistry";
-import type { VLinkSignedReceipt } from "../src/types/vlink";
+import type { VLinkRecord, VLinkSignedReceipt } from "../src/types/vlink";
 
 const TEST_OWNER_TOKEN = "test-owner-ws-test";
 const TEST_WRONG_OWNER_TOKEN = "test-owner-ws-other";
@@ -281,6 +281,113 @@ test("production creation rejects VLink-local tokens before workspace authorizat
     assert.equal(authorizationCalls, 0);
   } finally {
     await new Promise<void>((resolve, reject) => isolatedServer.close((err) => (err ? reject(err) : resolve())));
+  }
+});
+
+test("device flow binds VLink access to an active workspace operator and revocation blocks polling", async () => {
+  const registry = new InMemoryVLinkRegistry();
+  const isolated = createApp({
+    registry,
+    publicOrigin: "https://vlink.example.test",
+    pairingOrigin: "https://veklom.example.test/vlink/connect",
+    deviceAuthorizationEncryptionKey: "test-only-device-flow-encryption-key-32-bytes-minimum",
+    workspaceAuthenticator: async (token) => {
+      if (token === "human-owner") return { userId: "operator-1", email: "owner@example.test", workspaceId: "workspace-1" };
+      if (token === "human-other") return { userId: "operator-2", email: "other@example.test", workspaceId: "workspace-2" };
+      return undefined;
+    },
+  });
+  const server = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const startedResponse = await fetch(`${base}/api/v1/device/authorizations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ machineIdentity: "machine-e2e-1", displayName: "Demo Agent", sourceType: "agent-mcp" }),
+    });
+    assert.equal(startedResponse.status, 201);
+    const started = await startedResponse.json() as { deviceCode: string; userCode: string; verificationUri: string };
+    assert.match(started.verificationUri, /user_code=/);
+
+    const publicStatus = await fetch(`${base}/api/v1/device/authorizations/${started.userCode}`);
+    assert.equal(publicStatus.status, 200);
+    const publicBody = await publicStatus.text();
+    assert.equal(publicBody.includes("workspaceId"), false);
+    assert.equal(publicBody.includes("operatorId"), false);
+    assert.equal(publicBody.includes("deviceCode"), false);
+
+    const pending = await fetch(`${base}/api/v1/device/authorizations/token`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode: started.deviceCode }),
+    });
+    assert.equal(pending.status, 400);
+    assert.equal(((await pending.json()) as { status: string }).status, "authorization_pending");
+
+    const approvedResponse = await fetch(`${base}/api/v1/device/authorizations/${started.userCode}/approve`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: "Bearer human-owner" }, body: "{}",
+    });
+    assert.equal(approvedResponse.status, 200);
+    const approved = await approvedResponse.json() as { authorization: { status: string }; vlink: VLinkRecord };
+    assert.equal(approved.authorization.status, "authorized");
+    assert.equal(approved.vlink.workspaceId, "workspace-1");
+    assert.equal(approved.vlink.machineIdentity?.value, "machine-e2e-1");
+    assert.equal(approved.vlink.machineIdentity?.assurance, "client-asserted");
+    const differentOperatorReplay = await fetch(`${base}/api/v1/device/authorizations/${started.userCode}/approve`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: "Bearer human-other" }, body: "{}",
+    });
+    assert.equal(differentOperatorReplay.status, 404);
+
+    const tokenResponse = await fetch(`${base}/api/v1/device/authorizations/token`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode: started.deviceCode }),
+    });
+    assert.equal(tokenResponse.status, 200);
+    const result = await tokenResponse.json() as { credential: Credential; vlink: VLinkRecord; scope: string; audience: string };
+    assert.equal(result.scope, "vlink:connect");
+    assert.equal(result.audience, "VLink");
+    assert.equal(registry.authenticate(result.vlink.vlinkId, result.credential.token)?.status, "active");
+
+    const revoked = await fetch(`${base}/api/v1/vlinks/${result.vlink.vlinkId}/access/revoke`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${result.credential.token}` }, body: "{}",
+    });
+    assert.equal(revoked.status, 200);
+    assert.equal(registry.authenticate(result.vlink.vlinkId, result.credential.token), undefined);
+    const stalePoll = await fetch(`${base}/api/v1/device/authorizations/token`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode: started.deviceCode }),
+    });
+    assert.equal(stalePoll.status, 400);
+    assert.equal(((await stalePoll.json()) as { error: string }).error, "credential_revoked");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  }
+});
+
+test("only the active operator/workspace that made a denial can repeat it", async () => {
+  const isolated = createApp({
+    deviceAuthorizationEncryptionKey: "test-only-device-flow-encryption-key-32-bytes-minimum",
+    workspaceAuthenticator: async (token) => token === "human-owner"
+      ? { userId: "operator-1", workspaceId: "workspace-1" }
+      : token === "human-other" ? { userId: "operator-2", workspaceId: "workspace-2" } : undefined,
+  });
+  const server = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const startedResponse = await fetch(`${base}/api/v1/device/authorizations`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ machineIdentity: "machine-deny-1", displayName: "Denied Agent", sourceType: "container" }),
+    });
+    const started = await startedResponse.json() as { userCode: string; deviceCode: string };
+    const deny = (token: string) => fetch(`${base}/api/v1/device/authorizations/${started.userCode}/deny`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: "{}",
+    });
+    assert.equal((await deny("human-owner")).status, 200);
+    assert.equal((await deny("human-other")).status, 404);
+    const poll = await fetch(`${base}/api/v1/device/authorizations/token`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode: started.deviceCode }),
+    });
+    assert.equal(((await poll.json()) as { status: string }).status, "access_denied");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
   }
 });
 
