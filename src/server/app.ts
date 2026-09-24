@@ -1,17 +1,34 @@
 import express, { type NextFunction, type Request, type Response } from "express";
+import { createHmac, randomBytes } from "node:crypto";
 import { GoogleGenAI } from "@google/genai";
-import { InMemoryVLinkRegistry, type VLinkRegistry } from "./vlinkRegistry";
+import {
+  InMemoryVLinkRegistry,
+  type BootstrapAdmissionPolicy,
+  type VLinkRegistry,
+} from "./vlinkRegistry";
 import { createLeaseSealer } from "./leaseSealer";
+import type { LeaseSealer } from "./leaseSealer";
+import { authenticateVLinkRequest, captureVLinkRequestBodyHash } from "./requestProof";
 import * as cappoRelay from "./cappoRelay";
-import type { VLinkAccessCredentialSummary, VLinkSourceType } from "../types/vlink";
+import type { VLinkAccessCredentialSummary, VLinkDeviceBootstrapView, VLinkSourceType } from "../types/vlink";
 
 export interface VLinkWorkspaceIdentity {
   userId?: string;
   email?: string;
   workspaceId: string;
+  mfaVerified?: boolean;
 }
 
-export type VLinkWorkspaceAuthenticator = (token: string) => Promise<VLinkWorkspaceIdentity | undefined>;
+export interface VLinkWorkspaceAuthContext {
+  workspaceId?: string;
+  mfaCode?: string;
+  requireMfa?: boolean;
+}
+
+export type VLinkWorkspaceAuthenticator = (
+  token: string,
+  context?: VLinkWorkspaceAuthContext,
+) => Promise<VLinkWorkspaceIdentity | undefined>;
 
 export interface CreateAppOptions {
   registry?: VLinkRegistry;
@@ -20,10 +37,15 @@ export interface CreateAppOptions {
   enableDemoResponses?: boolean;
   allowUnboundCompatibility?: boolean;
   allowUnauthenticatedCreate?: boolean;
+  enableAnonymousBootstrap?: boolean;
   enrollmentGrantTtlSeconds?: number;
   accessTokenTtlSeconds?: number;
   lockerPhycerBaseUrl?: string;
   workspaceAuthenticator?: VLinkWorkspaceAuthenticator;
+  leaseSealer?: LeaseSealer | null;
+  bootstrapRateLimitKey?: string;
+  trustedProxyCidrs?: string[];
+  bootstrapAdmissionPolicy?: Partial<BootstrapAdmissionPolicy>;
 }
 
 const SOURCE_TYPES = new Set<VLinkSourceType>([
@@ -38,9 +60,7 @@ const SOURCE_TYPES = new Set<VLinkSourceType>([
 
 const originFor = (req: Request, configured?: string) => {
   if (configured) return configured.replace(/\/$/, "");
-  const forwardedProto = req.header("x-forwarded-proto")?.split(",")[0]?.trim();
-  const proto = forwardedProto || req.protocol;
-  return `${proto}://${req.get("host")}`;
+  return `${req.protocol}://${req.get("host")}`;
 };
 
 const getBoundVLinkId = (req: Request): string | undefined => {
@@ -59,6 +79,15 @@ const getBearerToken = (req: Request): string | undefined => {
 const clampSeconds = (value: number, fallback: number, max: number) => {
   if (!Number.isFinite(value)) return fallback;
   return Math.min(Math.max(Math.floor(value), 1), max);
+};
+
+const configuredInteger = (value: number | string | undefined, fallback: number, name: string, max: number) => {
+  if (value === undefined || value === "") return fallback;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    throw new Error(`${name} must be an integer between 1 and ${max}`);
+  }
+  return parsed;
 };
 
 const parseAllowedTargetHosts = () =>
@@ -102,13 +131,49 @@ const safeManifestJson = (manifest: unknown) => {
 export function createApp(options: CreateAppOptions = {}) {
   const app = express();
   const registry = options.registry ?? new InMemoryVLinkRegistry();
-  const leaseSealer = createLeaseSealer();
+  const leaseSealer = Object.hasOwn(options, "leaseSealer") ? options.leaseSealer ?? null : createLeaseSealer();
   registry.configureLeaseSealer(leaseSealer);
   const enableDemoResponses = options.enableDemoResponses ?? process.env.VLINK_ENABLE_DEMO_RESPONSES === "true";
   const allowUnboundCompatibility = options.allowUnboundCompatibility ?? process.env.VLINK_ALLOW_UNBOUND_COMPAT === "true";
   const allowUnauthenticatedCreate =
     options.allowUnauthenticatedCreate ??
     (process.env.NODE_ENV !== "production" || process.env.VLINK_ALLOW_UNAUTHENTICATED_CREATE === "true");
+  const enableAnonymousBootstrap = options.enableAnonymousBootstrap ??
+    (process.env.NODE_ENV !== "production" || process.env.VLINK_ANONYMOUS_BOOTSTRAP_ENABLED === "true");
+  const bootstrapPublicOrigin = options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || options.publicOrigin || process.env.VLINK_PUBLIC_ORIGIN;
+  if (process.env.NODE_ENV === "production" && enableAnonymousBootstrap) {
+    if (!bootstrapPublicOrigin?.trim()) {
+      throw new Error("VLINK_PAIRING_ORIGIN or VLINK_PUBLIC_ORIGIN must be configured before anonymous bootstrap can be enabled in production");
+    }
+    let parsedOrigin: URL;
+    try {
+      parsedOrigin = new URL(bootstrapPublicOrigin);
+    } catch {
+      throw new Error("The configured VLink bootstrap origin must be an absolute HTTPS origin");
+    }
+    const normalizedOrigin = bootstrapPublicOrigin.trim().replace(/\/+$/, "");
+    if (parsedOrigin.protocol !== "https:" || parsedOrigin.origin !== normalizedOrigin || parsedOrigin.username || parsedOrigin.password) {
+      throw new Error("The configured VLink bootstrap origin must be a canonical HTTPS origin without credentials or a path");
+    }
+  }
+  const configuredRateLimitKey = options.bootstrapRateLimitKey ?? process.env.VLINK_BOOTSTRAP_RATE_LIMIT_KEY;
+  if (process.env.NODE_ENV === "production" && enableAnonymousBootstrap && (!configuredRateLimitKey || Buffer.byteLength(configuredRateLimitKey, "utf8") < 32)) {
+    throw new Error("VLINK_BOOTSTRAP_RATE_LIMIT_KEY must contain at least 32 bytes before anonymous bootstrap can be enabled in production");
+  }
+  const bootstrapRateLimitKey = configuredRateLimitKey || randomBytes(32).toString("hex");
+  const bootstrapAdmissionPolicy: BootstrapAdmissionPolicy = {
+    perSourceLimit: configuredInteger(options.bootstrapAdmissionPolicy?.perSourceLimit ?? process.env.VLINK_BOOTSTRAP_SOURCE_LIMIT, 10, "VLINK_BOOTSTRAP_SOURCE_LIMIT", 10_000),
+    perSourceWindowSeconds: configuredInteger(options.bootstrapAdmissionPolicy?.perSourceWindowSeconds ?? process.env.VLINK_BOOTSTRAP_SOURCE_WINDOW_SECONDS, 600, "VLINK_BOOTSTRAP_SOURCE_WINDOW_SECONDS", 86_400),
+    globalLimit: configuredInteger(options.bootstrapAdmissionPolicy?.globalLimit ?? process.env.VLINK_BOOTSTRAP_GLOBAL_LIMIT, 100, "VLINK_BOOTSTRAP_GLOBAL_LIMIT", 100_000),
+    globalWindowSeconds: configuredInteger(options.bootstrapAdmissionPolicy?.globalWindowSeconds ?? process.env.VLINK_BOOTSTRAP_GLOBAL_WINDOW_SECONDS, 3600, "VLINK_BOOTSTRAP_GLOBAL_WINDOW_SECONDS", 86_400),
+  };
+  const trustedProxyCidrs = options.trustedProxyCidrs ?? (process.env.VLINK_TRUST_PROXY_CIDRS ?? "")
+    .split(",")
+    .map((cidr) => cidr.trim())
+    .filter(Boolean);
+  if (trustedProxyCidrs.some((cidr) => cidr === "*")) {
+    throw new Error("VLINK_TRUST_PROXY_CIDRS must not trust every proxy");
+  }
   const enrollmentGrantTtlSeconds = clampSeconds(
     options.enrollmentGrantTtlSeconds ?? Number(process.env.VLINK_ENROLLMENT_TTL_SECONDS ?? 900),
     900,
@@ -130,7 +195,7 @@ export function createApp(options: CreateAppOptions = {}) {
   const workspaceAuthenticator: VLinkWorkspaceAuthenticator | undefined =
     options.workspaceAuthenticator ??
     (lockerPhycerBaseUrl
-      ? async (token: string) => {
+      ? async (token: string, context: VLinkWorkspaceAuthContext = {}) => {
           const response = await fetch(`${lockerPhycerBaseUrl}/api/v1/auth/me`, {
             headers: { authorization: `Bearer ${token}`, accept: "application/json" },
             signal: AbortSignal.timeout(5_000),
@@ -141,32 +206,99 @@ export function createApp(options: CreateAppOptions = {}) {
             id?: string;
             email?: string;
             workspace_id?: string | null;
+            mfa_verified?: boolean;
           };
           const workspaceId = identity.workspace_id?.trim();
           if (!workspaceId) {
             throw new Error("LockerPhycer session is authenticated but is not bound to a workspace");
           }
+          const authorizedWorkspaceId = context.workspaceId?.trim() || workspaceId;
+          const ownerResponse = await fetch(
+            `${lockerPhycerBaseUrl}/api/v1/workspace/${encodeURIComponent(authorizedWorkspaceId)}/vlink-authorization`,
+            {
+              headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+              signal: AbortSignal.timeout(5_000),
+            },
+          );
+          if (ownerResponse.status === 401) return undefined;
+          if (ownerResponse.status === 403 || ownerResponse.status === 404) {
+            throw new Error("LockerPhycer workspace authorization denied");
+          }
+          if (!ownerResponse.ok) throw new Error(`LockerPhycer workspace authorization returned HTTP ${ownerResponse.status}`);
+          const ownerProof = (await ownerResponse.json()) as { authorized?: boolean; workspace_id?: string };
+          if (ownerProof.authorized !== true || ownerProof.workspace_id !== authorizedWorkspaceId) {
+            throw new Error("LockerPhycer workspace authorization denied");
+          }
+
+          let mfaVerified = false;
+          if (context.requireMfa && context.mfaCode?.trim()) {
+            const mfaResponse = await fetch(`${lockerPhycerBaseUrl}/api/v1/auth/mfa/verify`, {
+              method: "POST",
+              headers: { authorization: `Bearer ${token}`, accept: "application/json", "content-type": "application/json" },
+              body: JSON.stringify({ code: context.mfaCode.trim() }),
+              signal: AbortSignal.timeout(5_000),
+            });
+            if (mfaResponse.status !== 401 && mfaResponse.status !== 403) {
+              if (!mfaResponse.ok) throw new Error(`LockerPhycer MFA verification returned HTTP ${mfaResponse.status}`);
+              const result = (await mfaResponse.json()) as { verified?: boolean };
+              mfaVerified = result.verified === true;
+            }
+          }
           return {
             ...(identity.id ? { userId: identity.id } : {}),
             ...(identity.email ? { email: identity.email } : {}),
             workspaceId,
+            mfaVerified,
           };
         }
       : undefined);
 
   app.disable("x-powered-by");
-  app.use(express.json({ limit: "2mb" }));
-  app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+  if (trustedProxyCidrs.length) app.set("trust proxy", trustedProxyCidrs);
   app.use((req: Request, res: Response, next: NextFunction) => {
     const allowedOrigin = process.env.VLINK_CORS_ORIGIN || "*";
     res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-VLink-Id,X-Target-Url");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-VLink-Id,X-Target-Url,X-VLink-Device-Proof");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
     if (req.method === "OPTIONS") return res.status(204).end();
     next();
   });
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (!enableAnonymousBootstrap || req.method !== "POST") return next();
+    const rawPath = req.originalUrl.split("?", 1)[0] || "";
+    let decodedPath = rawPath;
+    try {
+      decodedPath = decodeURIComponent(rawPath);
+    } catch {
+      // Malformed paths are left to Express routing and cannot change the peer identity used below.
+    }
+    const isBootstrapPath = [rawPath, decodedPath].some((pathname) =>
+      pathname === "/api/v1/device/bootstrap" || pathname === "/api/v1/device/bootstrap/",
+    );
+    if (!isBootstrapPath) return next();
+
+    const peerAddress = (req.ip || req.socket.remoteAddress || "unknown").trim().toLowerCase();
+    const sourceFingerprint = createHmac("sha256", bootstrapRateLimitKey)
+      .update("vlink-anonymous-bootstrap-source/v1\0", "utf8")
+      .update(peerAddress, "utf8")
+      .digest("hex");
+    try {
+      const admission = registry.consumeDeviceBootstrapAdmission(sourceFingerprint, bootstrapAdmissionPolicy);
+      if (!admission.allowed) {
+        res.setHeader("Retry-After", String(admission.retryAfterSeconds));
+        return res.status(429).json({ error: "device_bootstrap_rate_limited", retryAfterSeconds: admission.retryAfterSeconds });
+      }
+      return next();
+    } catch {
+      return res.status(503).json({ error: "device_bootstrap_admission_unavailable" });
+    }
+  });
+
+  app.use(express.json({ limit: "2mb", verify: captureVLinkRequestBodyHash }));
+  app.use(express.urlencoded({ extended: true, limit: "2mb", verify: captureVLinkRequestBodyHash }));
 
   const resolveVLinkBinding = (req: Request, res: Response, forcedVLinkId?: string): string | undefined | null => {
     const suppliedVLinkId = getBoundVLinkId(req);
@@ -213,7 +345,7 @@ export function createApp(options: CreateAppOptions = {}) {
       res.status(401).json({ error: "vlink_access_token_required" });
       return null;
     }
-    const credential = registry.authenticate(vlinkId, token);
+    const credential = authenticateVLinkRequest(registry, req, vlinkId, token);
     if (!credential) {
       res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
       res.status(401).json({ error: "invalid_or_expired_vlink_access_token" });
@@ -244,6 +376,7 @@ export function createApp(options: CreateAppOptions = {}) {
       demoResponsesEnabled: enableDemoResponses,
       unboundCompatibilityEnabled: allowUnboundCompatibility,
       unauthenticatedCreateEnabled: allowUnauthenticatedCreate,
+      anonymousBootstrapEnabled: enableAnonymousBootstrap,
       workspaceAuthConfigured: Boolean(workspaceAuthenticator),
       persistence: "memory",
       leaseSealing: Boolean(leaseSealer),
@@ -276,6 +409,9 @@ export function createApp(options: CreateAppOptions = {}) {
         identity = await workspaceAuthenticator(token);
       } catch (error) {
         const message = error instanceof Error ? error.message : "workspace authentication unavailable";
+        if (message.includes("workspace authorization denied")) {
+          return res.status(403).json({ error: "workspace_access_denied" });
+        }
         if (message.includes("not bound to a workspace")) {
           return res.status(409).json({
             error: "workspace_binding_required",
@@ -376,6 +512,143 @@ export function createApp(options: CreateAppOptions = {}) {
     res.status(201).json({ pairing });
   });
 
+  app.post("/api/v1/device/bootstrap", (req, res) => {
+    if (!enableAnonymousBootstrap) return res.status(404).json({ error: "anonymous_bootstrap_disabled" });
+    const publicKeyPem = req.body?.publicKeyPem;
+    if (typeof publicKeyPem !== "string" || Buffer.byteLength(publicKeyPem, "utf8") > 2_048) {
+      return res.status(400).json({ error: "invalid_device_public_key" });
+    }
+    const input = {
+      displayName: typeof req.body?.displayName === "string" ? req.body.displayName : "",
+      environment: typeof req.body?.environment === "string" ? req.body.environment : "",
+      sourceType: req.body?.sourceType as VLinkSourceType,
+    };
+    if (!input.displayName.trim() || input.displayName.trim().length > 120 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(input.environment.trim()) || !SOURCE_TYPES.has(input.sourceType)) {
+      return res.status(400).json({ error: "invalid_device_bootstrap_request" });
+    }
+    const created = registry.createDeviceBootstrap(
+      originFor(req, options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || options.publicOrigin),
+      publicKeyPem,
+      input,
+      clampSeconds(Number(req.body?.ttlSeconds ?? 600), 600, 900),
+    );
+    if (!created) return res.status(503).json({ error: "device_bootstrap_capacity_or_key_error" });
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(201).json({ ...created, consequenceAuthority: "none" });
+  });
+
+  app.get("/api/v1/device/bootstrap/:pairingId", (req, res) => {
+    const bootstrap = registry.getDeviceBootstrap(req.params.pairingId);
+    if (!bootstrap) return res.status(404).json({ error: "device_bootstrap_not_found" });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ bootstrap, consequenceAuthority: "none" });
+  });
+
+  app.post("/api/v1/device/bootstrap/:pairingId/proof", (req, res) => {
+    const bootstrap = registry.verifyUnboundDeviceProof(
+      req.params.pairingId,
+      String(req.body?.nonce ?? ""),
+      String(req.body?.signature ?? ""),
+    );
+    if (!bootstrap) {
+      const current = registry.getDeviceBootstrap(req.params.pairingId);
+      if (!current) return res.status(404).json({ error: "device_bootstrap_not_found" });
+      if (current.status === "expired") return res.status(410).json({ error: "device_bootstrap_expired" });
+      return res.status(400).json({ error: "invalid_device_proof" });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ bootstrap, consequenceAuthority: "none" });
+  });
+
+  app.post("/api/v1/device/bootstrap/:pairingId/approve", async (req, res) => {
+    const current = registry.getDeviceBootstrap(req.params.pairingId);
+    if (!current) return res.status(404).json({ error: "device_bootstrap_not_found" });
+    if (current.status === "expired") return res.status(410).json({ error: "device_bootstrap_expired" });
+    if (current.status === "pending" && !current.deviceProofVerified) {
+      return res.status(409).json({ error: "device_proof_required" });
+    }
+    const token = getBearerToken(req);
+    if (!token || token.startsWith("vle_") || token.startsWith("vlt_")) {
+      res.setHeader("WWW-Authenticate", 'Bearer realm="VLink workspace approval"');
+      return res.status(401).json({ error: "workspace_session_required" });
+    }
+    if (!workspaceAuthenticator) return res.status(503).json({ error: "workspace_authority_unconfigured" });
+
+    const mfaCode = String(req.body?.mfaCode ?? "").trim();
+    if (!mfaCode) return res.status(403).json({ error: "mfa_required" });
+
+    let identity: VLinkWorkspaceIdentity | undefined;
+    try {
+      identity = await workspaceAuthenticator(token, {
+        ...(current.vlinkId ? { workspaceId: registry.get(current.vlinkId)?.workspaceId } : {}),
+        requireMfa: true,
+        mfaCode,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("workspace authorization denied")) {
+        return res.status(403).json({ error: "workspace_access_denied" });
+      }
+      return res.status(503).json({ error: "workspace_authority_unavailable" });
+    }
+    if (!identity) return res.status(401).json({ error: "invalid_workspace_session" });
+    if (current.vlinkId) {
+      const existing = registry.get(current.vlinkId);
+      if (!existing || identity.workspaceId !== existing.workspaceId) return res.status(403).json({ error: "workspace_access_denied" });
+    }
+    if (!identity.mfaVerified) return res.status(403).json({ error: "mfa_required" });
+    if (!leaseSealer) return res.status(503).json({ error: "enrollment_grant_recovery_unavailable" });
+
+    const approved = registry.approveDeviceBootstrap(
+      req.params.pairingId,
+      identity.workspaceId,
+      originFor(req, options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || options.publicOrigin),
+      enrollmentGrantTtlSeconds,
+    );
+    if (!approved) {
+      const latest = registry.getDeviceBootstrap(req.params.pairingId);
+      if (latest?.status === "expired") return res.status(410).json({ error: "device_bootstrap_expired" });
+      return res.status(409).json({ error: "device_bootstrap_not_approvable" });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ ...approved, consequenceAuthority: "none" });
+  });
+
+  app.post("/api/v1/vlinks/:vlinkId/device-pairings", (req, res) => {
+    if (!registry.get(req.params.vlinkId)) return res.status(404).json({ error: "vlink_not_found" });
+    const publicKeyPem = req.body?.publicKeyPem;
+    if (typeof publicKeyPem !== "string" || Buffer.byteLength(publicKeyPem, "utf8") > 2_048) {
+      return res.status(400).json({ error: "invalid_device_public_key" });
+    }
+    const ttlSeconds = clampSeconds(Number(req.body?.ttlSeconds ?? 600), 600, 900);
+    const created = registry.createDevicePairing(
+      req.params.vlinkId,
+      originFor(req, options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || options.publicOrigin),
+      publicKeyPem,
+      ttlSeconds,
+    );
+    if (!created) return res.status(400).json({ error: "invalid_device_public_key" });
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(201).json({ ...created, consequenceAuthority: "none" });
+  });
+
+  app.post("/api/v1/vlinks/:vlinkId/pairing/:pairingId/device-proof", (req, res) => {
+    const pairing = registry.verifyDevicePairingProof(
+      req.params.vlinkId,
+      req.params.pairingId,
+      String(req.body?.nonce ?? ""),
+      String(req.body?.signature ?? ""),
+    );
+    if (!pairing) {
+      const current = registry.getPairingStatus(req.params.vlinkId, req.params.pairingId);
+      if (!current) return res.status(404).json({ error: "pairing_not_found" });
+      if (current.status === "expired") return res.status(410).json({ error: "pairing_expired" });
+      return res.status(400).json({ error: "invalid_device_proof" });
+    }
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ pairing });
+  });
+
   app.get("/api/v1/vlinks/:vlinkId/pairing/:pairingId", (req, res) => {
     const pairing = registry.getPairingStatus(req.params.vlinkId, req.params.pairingId);
     if (!pairing) return res.status(404).json({ error: "pairing_not_found" });
@@ -392,18 +665,34 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.status(401).json({ error: "workspace_session_required" });
     }
 
+    const current = registry.getPairingStatus(req.params.vlinkId, req.params.pairingId);
+    if (!current) return res.status(404).json({ error: "pairing_not_found" });
+    if (current.deviceKeyThumbprint && current.deviceProofVerified !== true) {
+      return res.status(409).json({ error: "device_proof_required" });
+    }
+
     if (!workspaceAuthenticator) return res.status(503).json({ error: "workspace_authority_unconfigured" });
+    const mfaCode = String(req.body?.mfaCode ?? "").trim();
+    if (!mfaCode) return res.status(403).json({ error: "mfa_required" });
 
     let identity: VLinkWorkspaceIdentity | undefined;
     try {
-      identity = await workspaceAuthenticator(token);
-    } catch {
+      identity = await workspaceAuthenticator(token, {
+        workspaceId: vlink.workspaceId,
+        requireMfa: true,
+        mfaCode,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("workspace authorization denied")) {
+        return res.status(403).json({ error: "workspace_access_denied" });
+      }
       return res.status(503).json({ error: "workspace_authority_unavailable" });
     }
     if (!identity) return res.status(401).json({ error: "invalid_workspace_session" });
     if (identity.workspaceId !== vlink.workspaceId) {
       return res.status(403).json({ error: "workspace_access_denied" });
     }
+    if (identity.mfaVerified !== true) return res.status(403).json({ error: "mfa_required" });
 
     const approvalCode = String(req.body?.approvalCode ?? req.body?.oneTimeCode ?? "");
     const approved = registry.approvePairing(req.params.vlinkId, req.params.pairingId, approvalCode);
@@ -422,13 +711,41 @@ export function createApp(options: CreateAppOptions = {}) {
   app.post("/api/v1/vlinks/:vlinkId/pairing/:pairingId/approve", approvePairing);
   app.post("/api/v1/vlinks/:vlinkId/pairing/:pairingId/complete", approvePairing);
 
-  app.post("/api/v1/vlinks/:vlinkId/pairing/:pairingId/exchange", (req, res) => {
-    const deviceCode = String(req.body?.deviceCode ?? "");
+  app.post("/api/v1/vlinks/:vlinkId/pairing/:pairingId/exchange-challenge", (req, res) => {
+    if (!leaseSealer) return res.status(503).json({ error: "recoverable_exchange_unavailable" });
     const current = registry.getPairingStatus(req.params.vlinkId, req.params.pairingId);
     if (!current) return res.status(404).json({ error: "pairing_not_found" });
     if (current.status === "expired") return res.status(410).json({ error: "pairing_expired" });
     if (current.status === "pending") return res.status(409).json({ error: "pairing_not_approved" });
+    if (!current.deviceKeyThumbprint) return res.status(409).json({ error: "device_key_binding_required" });
+    const challenge = registry.issueDeviceExchangeChallenge(req.params.vlinkId, req.params.pairingId);
+    if (!challenge) return res.status(409).json({ error: "pairing_not_recoverable" });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ challenge });
+  });
+
+  app.post("/api/v1/vlinks/:vlinkId/pairing/:pairingId/exchange", (req, res) => {
+    const current = registry.getPairingStatus(req.params.vlinkId, req.params.pairingId);
+    if (!current) return res.status(404).json({ error: "pairing_not_found" });
+    if (current.status === "expired") return res.status(410).json({ error: "pairing_expired" });
+    if (current.status === "pending") return res.status(409).json({ error: "pairing_not_approved" });
+
+    if (current.deviceKeyThumbprint) {
+      if (!leaseSealer) return res.status(503).json({ error: "recoverable_exchange_unavailable" });
+      const credential = registry.exchangeDevicePairing(
+        req.params.vlinkId,
+        req.params.pairingId,
+        String(req.body?.nonce ?? ""),
+        String(req.body?.signature ?? ""),
+        accessTokenTtlSeconds,
+      );
+      if (!credential) return res.status(400).json({ error: "invalid_device_proof_or_exchange" });
+      res.setHeader("Cache-Control", "no-store");
+      return res.json({ credential, pairing: registry.getPairingStatus(req.params.vlinkId, req.params.pairingId) });
+    }
+
     if (current.status === "exchanged") return res.status(400).json({ error: "pairing_already_exchanged" });
+    const deviceCode = String(req.body?.deviceCode ?? "");
 
     const credential = registry.exchangePairing(
       req.params.vlinkId,
@@ -485,7 +802,7 @@ export function createApp(options: CreateAppOptions = {}) {
       return false;
     }
     if (token?.startsWith("vlt_")) {
-      if (registry.authenticate(vlinkId, token)) return true;
+      if (authenticateVLinkRequest(registry, req, vlinkId, token)) return true;
       res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
       res.status(401).json({ error: "invalid_or_expired_vlink_access_token" });
       return false;

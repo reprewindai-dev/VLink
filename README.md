@@ -13,7 +13,7 @@ The current product flow is:
 - Versioned `VLink` TypeScript contract (`vlink/v1`).
 - Replaceable registry interface with restart-safe local file persistence when `VLINK_STATE_PATH` is configured.
 - Production startup fails closed if `VLINK_STATE_PATH` is missing instead of silently using volatile connection/access state.
-- Durable snapshots retain VLink identity, hashed enrollment grants, hashed pairing secrets, hashed/revoked workload credentials, and the bounded activity history.
+- Durable snapshots retain VLink identity, hashed enrollment grants, hashed pairing secrets, hashed/revoked workload credentials, and the bounded activity history. An anonymous-bootstrap enrollment grant is additionally sealed at rest so an authenticated workspace owner can recover the same grant after a lost approval response.
 - Durable writes use a same-directory temporary file, file sync, and rename; a failed durable write restores the previous in-memory snapshot rather than returning a successful mutation that was not committed.
 - Durable-state loading validates format/schema, rejects duplicate identities and orphaned cross-VLink state, and fails closed on corrupt or unsupported state.
 - VLink create/list/read endpoints.
@@ -22,9 +22,13 @@ The current product flow is:
 - A short-lived enrollment grant returned only at VLink creation. The VLink ID alone cannot initiate pairing.
 - Browser/device pairing with **two independent secrets**: a browser approval secret in the QR URL fragment and a separate device-exchange secret retained by the initiating tool/device.
 - Approval and credential issuance are separate operations. Browser approval cannot mint a workload token by itself.
+- Unknown devices can anonymously request a short-lived pairing challenge for an existing VLink. The device key is generated locally and must prove possession before an owning-workspace operator can approve it.
+- Anonymous bootstrap can also create a workspace-bound VLink after owner/MFA approval. The owner receives a short-lived enrollment grant; a lost response is recoverable by the same owner after fresh MFA, without minting another grant.
+- Device approval requires a LockerPhycer session bound to the VLink's owning workspace and recent MFA; the UI displays the device-key thumbprint for confirmation.
+- Device exchange is recoverable after a lost response: a fresh device-key proof returns the same active credential rather than minting another. The credential is sealed at rest, so this path requires `VLINK_LEASE_SEALING_KEY`.
 - One-time device exchange for an opaque, short-lived VLink bearer token.
-- Enrollment grants and workload tokens stored hashed server-side rather than retained in usable form.
-- VLink access tokens bound to one VLink with cross-VLink replay denial, TTL expiry, and immediate revocation.
+- Normal enrollment grants and workload tokens are stored hashed server-side. The bootstrap-created owner grant is encrypted at rest only for bounded recovery; it is returned only to the authenticated, MFA-verified owning-workspace session and is never returned by public bootstrap-status reads.
+- VLink access credentials bound to one VLink with cross-VLink replay denial, TTL expiry, and immediate revocation; device-bound credentials require request-level Ed25519 proof of possession.
 - Protected VLink-specific OpenAI-compatible, webhook, test, activity, receipt, and bounded-failover routes.
 - Unbound global `/v1` compatibility disabled by default.
 - Live Gemini execution when `GEMINI_API_KEY` and a model are configured.
@@ -47,6 +51,7 @@ The current product flow is:
 - Each failover event records measured per-attempt outcomes and latencies, final backend, recovery state, and total latency without storing request/response bodies or forwarding the VLink bearer token.
 - Failover evidence passes through the signed-receipt path.
 - React UI for Create → QR approval → automatic device exchange → temporary token → authenticated test/activity.
+- Anonymous device bootstrap grants neither a VLink credential nor consequence authority. VLink access remains distinct from CAPPO's final consequence-authority decision.
 
 ## Proof gates
 
@@ -101,8 +106,9 @@ VLink does **not** currently claim any of the following:
 - External anchoring/witnessing of the VLink signing key or receipt stream.
 - Formal non-repudiation.
 - Production SPIFFE/SPIRE workload identity issuance or verification.
-- Veklom account/workspace authentication for management routes.
-- Hardware attestation or enclave verification.
+- Hardware-backed physical machine attestation.
+- Device-bound credential request proofs survive restart only with the single-node file registry; a horizontally scaled replay coordinator is not implemented.
+- Multi-process coordination for the file-backed registry; it is a single-node store.
 - Zero-downtime, zero-loss, or transparent failover for arbitrary consequential operations.
 - Multi-target health orchestration, automatic backend promotion, or provider semantic equivalence.
 - General zero-data-loss rollback. Compensation semantics must be defined and verified per consequence type/provider.
@@ -134,7 +140,11 @@ For restart-safe local state, configure a persistent path:
 VLINK_STATE_PATH=.runtime/vlink-state.json
 ```
 
-Production mode requires a non-empty `VLINK_STATE_PATH`.
+Production mode requires:
+
+- `VLINK_STATE_PATH` on persistent storage;
+- `VLINK_LOCKERPHYCER_URL` (or `LOCKERPHYCER_URL`) for workspace identity and approval;
+- a valid `VLINK_LEASE_SEALING_KEY` (32-byte base64 or 64-character hex) for recoverable device exchange.
 
 Governed capability leases additionally require:
 
@@ -143,9 +153,9 @@ VLINK_LEASE_SEALING_KEY=<32-byte base64 or 64-character hex key>
 VLINK_CAPI_BASE_URL=http://capi.example.internal:3003
 ```
 
-The lease sealing key is used only for local AES-256-GCM protection of CAPPO
-holder credentials. VLink forwards those credentials only to the configured
-cAPI Interlink boundary.
+The lease sealing key is used for local AES-256-GCM protection of recoverable
+device-exchange credentials and CAPPO holder credentials. VLink forwards CAPPO
+holder credentials only to the configured cAPI Interlink boundary.
 
 ## Environment variables
 
@@ -154,7 +164,13 @@ cAPI Interlink boundary.
 | `PORT` | HTTP port. Default `3000`. |
 | `VLINK_PUBLIC_ORIGIN` | Canonical public origin used in generated manifests/endpoints. |
 | `VLINK_CORS_ORIGIN` | Allowed browser origin. Default `*` for local/prototype use; set explicitly in production. |
-| `VLINK_STATE_PATH` | Required in production. Persistent single-node registry state for VLink identity, hashed access/pairing state, revocation, and bounded activity metadata. |
+| `VLINK_STATE_PATH` | Required in production. Persistent single-node registry state for VLink identity, hashed access/pairing state, revocation, bootstrap admission windows, bounded request-proof replay records, and activity metadata. |
+| `VLINK_LOCKERPHYCER_URL` | Required in production (or use `LOCKERPHYCER_URL`). LockerPhycer identity API used to validate workspace-bound sessions and recent MFA for pairing approval. |
+| `VLINK_ANONYMOUS_BOOTSTRAP_ENABLED` | Explicitly enables unknown-device bootstrap in production. Bootstrap remains off by default. Enabling it requires `VLINK_BOOTSTRAP_RATE_LIMIT_KEY` and a canonical HTTPS `VLINK_PAIRING_ORIGIN` or `VLINK_PUBLIC_ORIGIN`. |
+| `VLINK_BOOTSTRAP_RATE_LIMIT_KEY` | Required (at least 32 bytes) when anonymous bootstrap is enabled in production. HMAC key used to persist source fingerprints without storing source IPs. Keep stable across restarts; rotation resets per-source quotas. |
+| `VLINK_TRUST_PROXY_CIDRS` | Optional comma-separated trusted reverse-proxy CIDRs. Only configure the exact proxy networks in front of VLink; otherwise the direct socket peer is used. Never set this to `*`. |
+| `VLINK_BOOTSTRAP_SOURCE_LIMIT` / `VLINK_BOOTSTRAP_SOURCE_WINDOW_SECONDS` | Anonymous bootstrap create limit per source fingerprint. Defaults to 10 requests per 600 seconds. |
+| `VLINK_BOOTSTRAP_GLOBAL_LIMIT` / `VLINK_BOOTSTRAP_GLOBAL_WINDOW_SECONDS` | Anonymous bootstrap create limit across the VLink instance. Defaults to 100 requests per 3600 seconds. |
 | `VLINK_ENROLLMENT_TTL_SECONDS` | Enrollment-grant lifetime. Default `900`, clamped to at most one hour. |
 | `VLINK_ACCESS_TOKEN_TTL_SECONDS` | Temporary workload-token lifetime. Default `3600`, clamped to at most one day. |
 | `VLINK_ALLOW_UNBOUND_COMPAT` | Deliberately enable unbound global compatibility traffic. Defaults off. |
@@ -165,7 +181,7 @@ cAPI Interlink boundary.
 | `GEMINI_MODEL` | Gemini model identifier used for live execution. |
 | `VLINK_ENABLE_DEMO_RESPONSES` | Set `true` only for deliberately labeled demo chat responses. Defaults off. |
 | `VLINK_ALLOWED_TARGET_HOSTS` | Comma-separated hostname allowlist for custom and failover targets. |
-| `VLINK_LEASE_SEALING_KEY` | AES-256-GCM key for sealed CAPPO holder credentials: 32-byte base64 or 64-character hex. |
+| `VLINK_LEASE_SEALING_KEY` | Required in production. AES-256-GCM key for recoverable device-exchange credentials and sealed CAPPO holder credentials: 32-byte base64 or 64-character hex. |
 | `VLINK_CAPI_BASE_URL` | Base URL for the cAPI Interlink service used by governed lease relays. |
 
 ## Connection protocol
@@ -183,7 +199,7 @@ curl -X POST http://localhost:3000/api/v1/vlinks \
   }'
 ```
 
-The creation response contains the non-secret VLink record, an expiring `vle_...` enrollment grant, and the manifest location. The enrollment grant authorizes **pairing initiation only**; it is not workload authority.
+The creation response contains the non-secret VLink record, an expiring `vle_...` enrollment grant, and the manifest location. The enrollment grant can initiate pairing and bind a VLink lease to a CAPPO mount; it does not make CAPPO allow an action and is not consequence authority.
 
 ### 2. Initiate pairing
 
@@ -198,7 +214,7 @@ The initiating device receives an approval QR plus a separate `deviceCode`. The 
 
 ### 3. Approve and exchange
 
-Browser approval changes pairing state but returns no workload token. The initiating device exchanges its separate device code exactly once and receives the temporary `vlt_...` access token.
+Browser approval changes pairing state but returns no workload token. The initiating device exchanges its separate device code exactly once and receives a temporary `vlt_...` access credential. This legacy code/device-code flow remains bearer-compatible; the anonymous device-key flow additionally signs every protected request with `X-VLink-Device-Proof` (see [the protocol](docs/ANONYMOUS_DEVICE_PAIRING.md)).
 
 ### 4. Use ordinary OpenAI-compatible configuration
 
@@ -206,6 +222,8 @@ Browser approval changes pairing state but returns no workload token. The initia
 OPENAI_BASE_URL=http://localhost:3000/vlinks/<vlink-id>/v1
 OPENAI_API_KEY=<vlt-temporary-vlink-token>
 ```
+
+This ordinary OpenAI SDK example applies to legacy bearer credentials. Device-bound credentials require a signing-capable transport adapter; a bearer-only SDK cannot use them safely yet.
 
 ### 5. Retrieve and verify receipts
 
@@ -258,10 +276,11 @@ The same outcome is recorded as VLink activity and signed into a VLink receipt w
 ## Security posture of this release
 
 - **VLink ID = connection identifier, not authority.**
-- **Enrollment grant = short-lived permission to initiate pairing, not execute workloads.**
+- **Enrollment grant = short-lived VLink administration permission for pairing and lease binding, not CAPPO consequence authority.**
 - **Browser approval = human/device approval, not a workload credential.**
-- **VLink access token = short-lived authority for one VLink.**
+- **VLink access credential = short-lived access to one VLink, not CAPPO consequence authority.**
 - Access credentials are hashed server-side, expire, are revocable, and cannot be replayed across VLinks.
+- Device-bound credentials require an Ed25519 request proof bound to method, path/query, host, body hash, credential, timestamp, and one-use nonce; bounded replay records survive a single-node registry restart.
 - VLink bearer credentials are never forwarded as upstream authorization on supported custom/failover routes.
 - Manifests never publish enrollment, pairing, or workload credentials.
 - Unknown or contradictory VLink bindings fail before execution/activity creation.

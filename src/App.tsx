@@ -4,6 +4,7 @@ import { CheckCircle2, Copy, Link2, Play, QrCode, ShieldCheck, Unplug } from "lu
 import type {
   VLinkAccessCredential,
   VLinkActivityEvent,
+  VLinkDeviceBootstrapView,
   VLinkEnrollmentGrant,
   VLinkPairingRequest,
   VLinkPairingStatusView,
@@ -52,6 +53,14 @@ export default function App() {
   const [exchanging, setExchanging] = useState(false);
   const [pairingInfo, setPairingInfo] = useState<VLinkPairingStatusView | null>(null);
   const [pairingApproval, setPairingApproval] = useState<"idle" | "approved" | "failed">("idle");
+  const [bootstrapInfo, setBootstrapInfo] = useState<VLinkDeviceBootstrapView | null>(null);
+  const [bootstrapEnrollmentGrant, setBootstrapEnrollmentGrant] = useState<VLinkEnrollmentGrant | null>(null);
+  const [mfaCode, setMfaCode] = useState("");
+
+  const bootstrapTarget = useMemo(() => {
+    const match = window.location.pathname.match(/^\/pair\/bootstrap\/([^/]+)$/);
+    return match ? { pairingId: decodeURIComponent(match[1]) } : null;
+  }, []);
 
   const pairingTarget = useMemo(() => {
     const match = window.location.pathname.match(/^\/pair\/([^/]+)\/([^/]+)$/);
@@ -89,10 +98,53 @@ export default function App() {
 
   useEffect(() => {
     if (!pairingTarget) return;
-    api<{ pairing: VLinkPairingStatusView }>(
-      `/api/v1/vlinks/${pairingTarget.vlinkId}/pairing/${pairingTarget.pairingId}`,
-    ).then((result) => setPairingInfo(result.pairing)).catch(() => setPairingInfo(null));
+    let stopped = false;
+    let terminal = false;
+    const refresh = async () => {
+      if (stopped || terminal) return;
+      try {
+        const result = await api<{ pairing: VLinkPairingStatusView }>(
+          `/api/v1/vlinks/${pairingTarget.vlinkId}/pairing/${pairingTarget.pairingId}`,
+        );
+        if (stopped) return;
+        setPairingInfo(result.pairing);
+        terminal = result.pairing.status !== "pending";
+      } catch {
+        if (!stopped) setPairingInfo(null);
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 1500);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+    };
   }, [pairingTarget]);
+
+  useEffect(() => {
+    if (!bootstrapTarget) return;
+    let stopped = false;
+    let terminal = false;
+    const refresh = async () => {
+      if (stopped || terminal) return;
+      try {
+        const result = await api<{ bootstrap: VLinkDeviceBootstrapView }>(
+          `/api/v1/device/bootstrap/${bootstrapTarget.pairingId}`,
+        );
+        if (stopped) return;
+        setBootstrapInfo(result.bootstrap);
+        terminal = result.bootstrap.status !== "pending";
+      } catch {
+        if (!stopped) setBootstrapInfo(null);
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 1500);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+    };
+  }, [bootstrapTarget]);
 
   useEffect(() => {
     if (!pairing || !vlink || credential || exchanging) return;
@@ -229,7 +281,9 @@ export default function App() {
   };
 
   const approvePairing = async () => {
-    if (!pairingTarget?.approvalCode) return;
+    if (!pairingTarget) return;
+    if (!pairingTarget.approvalCode && !pairingInfo?.deviceKeyThumbprint) return;
+    if (pairingInfo?.deviceKeyThumbprint && pairingInfo.deviceProofVerified !== true) return;
     const sessionToken = accountToken();
     if (!sessionToken) {
       setError("Sign in with the workspace-owning Veklom account before approving this pairing.");
@@ -241,13 +295,52 @@ export default function App() {
       await api(`/api/v1/vlinks/${pairingTarget.vlinkId}/pairing/${pairingTarget.pairingId}/approve`, {
         method: "POST",
         headers: bearer(sessionToken),
-        body: JSON.stringify({ approvalCode: pairingTarget.approvalCode }),
+        body: JSON.stringify({
+          ...(pairingTarget.approvalCode ? { approvalCode: pairingTarget.approvalCode } : {}),
+          mfaCode,
+        }),
       });
       setPairingApproval("approved");
+      setMfaCode("");
+      setPairingInfo((current) => current ? { ...current, status: "approved" } : current);
       window.sessionStorage.removeItem(PENDING_APPROVAL_KEY);
     } catch (e) {
       setPairingApproval("failed");
-      setError(e instanceof Error ? e.message : "Pairing approval failed");
+      const message = e instanceof Error ? e.message : "Pairing approval failed";
+      setError(message === "mfa_required"
+        ? "Complete a recent LockerPhycer MFA challenge, then return here to approve this device."
+        : message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const approveDeviceBootstrap = async () => {
+    if (!bootstrapTarget || !bootstrapInfo || bootstrapInfo.status === "expired" || !bootstrapInfo.deviceProofVerified) return;
+    const sessionToken = accountToken();
+    if (!sessionToken) {
+      setError("Sign in with the workspace-owning Veklom account before approving this device.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<{ bootstrap: VLinkDeviceBootstrapView; enrollmentGrant: VLinkEnrollmentGrant }>(
+        `/api/v1/device/bootstrap/${bootstrapTarget.pairingId}/approve`,
+        {
+          method: "POST",
+          headers: bearer(sessionToken),
+          body: JSON.stringify({ mfaCode }),
+        },
+      );
+      setBootstrapInfo(result.bootstrap);
+      setBootstrapEnrollmentGrant(result.enrollmentGrant);
+      setMfaCode("");
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Device approval failed";
+      setError(message === "mfa_required"
+        ? "Enter a current LockerPhycer MFA code to approve this device."
+        : message);
     } finally {
       setBusy(false);
     }
@@ -276,6 +369,45 @@ export default function App() {
 
   const copy = (text: string) => navigator.clipboard?.writeText(text);
 
+  if (bootstrapTarget) {
+    const signedIn = Boolean(accountToken());
+    const returnTo = `${window.location.pathname}${window.location.search}`;
+    const loginHref = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+    return (
+      <main className="shell">
+        <section className="hero">
+          <div className="brand"><span className="brandMark">V</span><span>VLink</span></div>
+          <h1>Review an unknown device.</h1>
+          <p>This machine has no VLink yet. Its request grants no credential or consequence authority. Approval creates a workspace-bound VLink only after you verify its key and complete MFA.</p>
+        </section>
+        <section className="card">
+          <div className="eyebrow">ANONYMOUS DEVICE BOOTSTRAP</div>
+          {!bootstrapInfo ? <p className="muted">Loading the short-lived request…</p> : <>
+            <h2>{bootstrapInfo.status === "approved" ? "Device approved" : bootstrapInfo.status === "expired" ? "Request expired" : "Confirm this machine"}</h2>
+            <div className="statusRow"><span>{bootstrapInfo.displayName}</span><code>{bootstrapInfo.environment} · {bootstrapInfo.sourceType}</code></div>
+            <p>Requested {new Date(bootstrapInfo.createdAt).toLocaleString()}; expires {new Date(bootstrapInfo.expiresAt).toLocaleString()}.</p>
+            <div className="snippet"><div><strong>Device key fingerprint</strong><pre>{bootstrapInfo.deviceKeyThumbprint}</pre></div></div>
+            <div className="truthBadge"><ShieldCheck size={16}/>{bootstrapInfo.deviceProofVerified ? "The device proved possession of this key. Compare the fingerprint with the initiating machine before approving." : "Waiting for proof that the initiating device possesses its private key."}</div>
+            {bootstrapInfo.status === "approved" && bootstrapInfo.vlinkId && <div className="truthBadge"><CheckCircle2 size={16}/>Bound to VLink <code>{bootstrapInfo.vlinkId}</code>. The device must finish its signed exchange to receive its temporary access credential.</div>}
+            {bootstrapEnrollmentGrant && <>
+              <div className="snippet"><div><strong>Workspace enrollment grant — keep private</strong><pre>{bootstrapEnrollmentGrant.token}</pre></div><button onClick={() => copy(bootstrapEnrollmentGrant.token)} aria-label="Copy enrollment grant"><Copy size={15}/></button></div>
+              <p className="muted">This short-lived owner grant can initiate pairing and bind a CAPPO lease. It is not CAPPO consequence authority. It is held only in this page’s memory; if the response was lost, re-authenticate with MFA to recover it.</p>
+            </>}
+            {bootstrapInfo.status === "expired" && <div className="error">This request expired. The device must create a new bootstrap request.</div>}
+            {!signedIn && <div className="error">Sign in to the owning Veklom workspace before approval. <a href={loginHref}>Sign in to Veklom</a></div>}
+            {(bootstrapInfo.status === "pending" || (bootstrapInfo.status === "approved" && !bootstrapEnrollmentGrant)) && signedIn && <>
+              <label>LockerPhycer MFA code<input value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} inputMode="numeric" autoComplete="one-time-code" maxLength={12} /></label>
+              <button className="primary" disabled={busy || !bootstrapInfo.deviceProofVerified || !mfaCode.trim()} onClick={approveDeviceBootstrap}>
+                <ShieldCheck size={17}/> {busy ? "Verifying…" : bootstrapInfo.status === "pending" ? "Verify key and approve" : "Recover enrollment grant"}
+              </button>
+            </>}
+            {error && <div className="error">{error}</div>}
+          </>}
+        </section>
+      </main>
+    );
+  }
+
   if (pairingTarget) {
     const signedIn = Boolean(accountToken());
     const returnTo = `${window.location.pathname}${window.location.search}`;
@@ -284,19 +416,23 @@ export default function App() {
       <main className="shell">
         <section className="hero">
           <div className="brand"><span className="brandMark">V</span><span>VLink</span></div>
-          <h1>Approve this VLink pairing.</h1>
-          <p>This browser can approve the request, but it cannot mint the workload credential. The initiating tool keeps a separate device-exchange secret and receives the temporary access token only after approval.</p>
+          <h1>Review this VLink device request.</h1>
+          <p>Unknown devices may request pairing, but bootstrap grants no consequence authority. Approval requires the owning workspace and recent MFA; the device receives access only after proving possession of its private key.</p>
         </section>
         <section className="card">
           <div className="eyebrow">PAIRING REQUEST</div>
           <h2>{pairingApproval === "approved" ? "Pairing approved" : "Confirm connection"}</h2>
           <div className="statusRow"><code>{pairingTarget.vlinkId}</code><code>{pairingTarget.pairingId}</code></div>
           {pairingInfo?.expiresAt && <p>Expires at {new Date(pairingInfo.expiresAt).toLocaleString()}.</p>}
-          {!pairingTarget.approvalCode && <div className="error">This page has no one-time approval code. Open it from the VLink QR code.</div>}
+          {pairingInfo?.deviceKeyThumbprint && <div className="snippet"><div><strong>Device key fingerprint</strong><pre>{pairingInfo.deviceKeyThumbprint}</pre></div></div>}
+          {pairingInfo?.deviceKeyThumbprint && <div className="truthBadge"><ShieldCheck size={16}/>{pairingInfo.deviceProofVerified ? "Device proved possession. Compare this fingerprint with the one shown by the initiating machine before approving." : "Waiting for the device to prove possession of its key."}</div>}
+          {!pairingTarget.approvalCode && !pairingInfo?.deviceKeyThumbprint && <div className="error">This legacy pairing page has no one-time approval code. Open it from the VLink QR code.</div>}
+          {pairingInfo?.status === "expired" && <div className="error">This pairing request expired. Start a new request from the device.</div>}
           {!signedIn && <div className="error">Sign in with the Veklom account that owns this workspace before approving. <a href={loginHref}>Sign in to Veklom</a></div>}
-          {pairingApproval === "approved" ? <div className="truthBadge"><CheckCircle2 size={16}/> Approved. Return to the initiating device; it can now exchange its separate device code for temporary access.</div> :
-            signedIn && <button className="primary" disabled={busy || !pairingTarget.approvalCode || pairingInfo?.status === "expired"} onClick={approvePairing}>
-              <ShieldCheck size={17}/> {busy ? "Approving…" : "Approve pairing"}
+          {pairingInfo?.status === "pending" && signedIn && <label>LockerPhycer MFA code<input value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} inputMode="numeric" autoComplete="one-time-code" maxLength={12} /></label>}
+          {pairingApproval === "approved" ? <div className="truthBadge"><CheckCircle2 size={16}/> Approved. Return to the initiating device; it can now prove key possession and recover its temporary VLink access credential.</div> :
+            signedIn && <button className="primary" disabled={busy || !mfaCode.trim() || pairingInfo?.status === "expired" || (pairingTarget.approvalCode ? false : !pairingInfo?.deviceKeyThumbprint || pairingInfo.deviceProofVerified !== true)} onClick={approvePairing}>
+              <ShieldCheck size={17}/> {busy ? "Approving…" : "Approve this device"}
             </button>}
           {pairingApproval === "failed" && error && <div className="error">{error}</div>}
         </section>
