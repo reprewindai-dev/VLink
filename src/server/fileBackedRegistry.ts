@@ -15,16 +15,20 @@ import type {
   VLinkAccessCredential,
   VLinkAccessCredentialSummary,
   VLinkActivityEvent,
+  VLinkDeviceBootstrapView,
   VLinkEnrollmentGrant,
   VLinkEnrollmentGrantSummary,
   VLinkManifest,
   VLinkPairingRequest,
+  VLinkPairingChallenge,
   VLinkPairingStatusView,
   VLinkRecord,
   VLinkLeaseView,
 } from "../types/vlink";
 import {
   type BindLeaseInput,
+  type BootstrapAdmissionPolicy,
+  type CreateDeviceBootstrapInput,
   InMemoryVLinkRegistry,
   type LeasePatch,
   type CreateVLinkInput,
@@ -32,6 +36,7 @@ import {
   type VLinkRegistrySnapshot,
 } from "./vlinkRegistry";
 import type { LeaseSealer } from "./leaseSealer";
+import type { DeviceRequestProof } from "./pairingProof";
 
 export interface FileBackedVLinkRegistryOptions {
   statePath: string;
@@ -80,11 +85,47 @@ export class FileBackedVLinkRegistry implements VLinkRegistry {
     return this.commit(() => this.inner.createPairing(vlinkId, origin, ttlSeconds, now));
   }
 
+  createDevicePairing(vlinkId: string, origin: string, publicKeyPem: string, ttlSeconds?: number, now?: Date) {
+    return this.commit(() => this.inner.createDevicePairing(vlinkId, origin, publicKeyPem, ttlSeconds, now));
+  }
+
+  createDeviceBootstrap(origin: string, publicKeyPem: string, input: CreateDeviceBootstrapInput, ttlSeconds?: number, now?: Date) {
+    return this.commit(() => this.inner.createDeviceBootstrap(origin, publicKeyPem, input, ttlSeconds, now));
+  }
+
+  consumeDeviceBootstrapAdmission(sourceFingerprint: string, policy: BootstrapAdmissionPolicy, now?: Date) {
+    return this.commit(() => this.inner.consumeDeviceBootstrapAdmission(sourceFingerprint, policy, now));
+  }
+
+  verifyUnboundDeviceProof(pairingId: string, nonce: string, signature: string, now?: Date): VLinkDeviceBootstrapView | undefined {
+    return this.commit(() => this.inner.verifyUnboundDeviceProof(pairingId, nonce, signature, now));
+  }
+
+  getDeviceBootstrap(pairingId: string, now?: Date): VLinkDeviceBootstrapView | undefined {
+    return this.commit(() => this.inner.getDeviceBootstrap(pairingId, now));
+  }
+
+  approveDeviceBootstrap(pairingId: string, workspaceId: string, origin: string, grantTtlSeconds?: number, now?: Date) {
+    return this.commit(() => this.inner.approveDeviceBootstrap(pairingId, workspaceId, origin, grantTtlSeconds, now));
+  }
+
+  verifyDevicePairingProof(vlinkId: string, pairingId: string, nonce: string, signature: string, now?: Date): VLinkPairingStatusView | undefined {
+    return this.commit(() => this.inner.verifyDevicePairingProof(vlinkId, pairingId, nonce, signature, now));
+  }
+
+  issueDeviceExchangeChallenge(vlinkId: string, pairingId: string, now?: Date): VLinkPairingChallenge | undefined {
+    return this.commit(() => this.inner.issueDeviceExchangeChallenge(vlinkId, pairingId, now));
+  }
+
+  exchangeDevicePairing(vlinkId: string, pairingId: string, nonce: string, signature: string, credentialTtlSeconds?: number, now?: Date): VLinkAccessCredential | undefined {
+    return this.commit(() => this.inner.exchangeDevicePairing(vlinkId, pairingId, nonce, signature, credentialTtlSeconds, now));
+  }
+
   getPairingStatus(vlinkId: string, pairingId: string, now?: Date): VLinkPairingStatusView | undefined {
     return this.commit(() => this.inner.getPairingStatus(vlinkId, pairingId, now));
   }
 
-  approvePairing(vlinkId: string, pairingId: string, approvalCode: string, now?: Date): VLinkPairingStatusView | undefined {
+  approvePairing(vlinkId: string, pairingId: string, approvalCode?: string, now?: Date): VLinkPairingStatusView | undefined {
     return this.commit(() => this.inner.approvePairing(vlinkId, pairingId, approvalCode, now));
   }
 
@@ -98,8 +139,8 @@ export class FileBackedVLinkRegistry implements VLinkRegistry {
     return this.commit(() => this.inner.exchangePairing(vlinkId, pairingId, deviceCode, credentialTtlSeconds, now));
   }
 
-  authenticate(vlinkId: string, token: string, now?: Date): VLinkAccessCredentialSummary | undefined {
-    return this.inner.authenticate(vlinkId, token, now);
+  authenticate(vlinkId: string, token: string, now?: Date, requestProof?: DeviceRequestProof): VLinkAccessCredentialSummary | undefined {
+    return this.commit(() => this.inner.authenticate(vlinkId, token, now, requestProof));
   }
 
   revokeCredential(vlinkId: string, credentialId: string, now?: Date): VLinkAccessCredentialSummary | undefined {

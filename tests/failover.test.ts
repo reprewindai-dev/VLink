@@ -60,7 +60,7 @@ const { app } = createApp({
   registry,
   publicOrigin: "https://connect.example.test",
   pairingOrigin: "https://app.example.test",
-  workspaceAuthenticator: async (token) => token === TEST_OWNER_TOKEN ? { workspaceId: "ws-failover" } : undefined,
+  workspaceAuthenticator: async (token) => token === TEST_OWNER_TOKEN ? { workspaceId: "ws-failover", mfaVerified: true } : undefined,
   enableDemoResponses: true,
   accessTokenTtlSeconds: 3600,
   enrollmentGrantTtlSeconds: 900,
@@ -146,7 +146,7 @@ async function createCredential(): Promise<{ created: Created; credential: Crede
   const approve = await fetch(`${appBase}/api/v1/vlinks/${created.vlink.vlinkId}/pairing/${pairing.pairing.pairingId}/approve`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${TEST_OWNER_TOKEN}` },
-    body: JSON.stringify({ approvalCode: pairing.pairing.approvalCode }),
+    body: JSON.stringify({ approvalCode: pairing.pairing.approvalCode, mfaCode: "123456" }),
   });
   assert.equal(approve.status, 200);
 

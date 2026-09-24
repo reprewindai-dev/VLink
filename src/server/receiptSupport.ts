@@ -2,6 +2,7 @@ import type { Express, Request, Response } from "express";
 import type { VLinkRegistry } from "./vlinkRegistry";
 import type { VLinkSignedReceipt } from "../types/vlink";
 import { VLinkReceiptSigner, verifyVLinkReceipt } from "./receiptSigner";
+import { authenticateVLinkRequest } from "./requestProof";
 
 export interface ReceiptSupportOptions {
   privateKeyPem?: string;
@@ -41,7 +42,7 @@ export const installReceiptSupport = (
       res.status(401).json({ error: "vlink_access_token_required" });
       return false;
     }
-    if (!registry.authenticate(vlinkId, token)) {
+    if (!authenticateVLinkRequest(registry, req, vlinkId, token)) {
       res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
       res.status(401).json({ error: "invalid_or_expired_vlink_access_token" });
       return false;

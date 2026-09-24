@@ -165,6 +165,31 @@ export interface VLinkPairingStatusView {
   expiresAt: string;
   approvedAt?: string;
   exchangedAt?: string;
+  deviceKeyThumbprint?: string;
+  deviceProofVerified?: boolean;
+}
+
+export interface VLinkPairingChallenge {
+  nonce: string;
+  expiresAt: string;
+}
+
+export type VLinkDeviceBootstrapStatus = "pending" | "approved" | "expired";
+
+/** Public view of an unbound device request. It carries identity proof state, never authority. */
+export interface VLinkDeviceBootstrapView {
+  pairingId: string;
+  approvalUrl: string;
+  status: VLinkDeviceBootstrapStatus;
+  createdAt: string;
+  expiresAt: string;
+  displayName: string;
+  environment: string;
+  sourceType: VLinkSourceType;
+  deviceKeyThumbprint: string;
+  deviceProofVerified: boolean;
+  /** Set only after a workspace owner has approved and the VLink has been created. */
+  vlinkId?: string;
 }
 
 export interface VLinkAccessCredential {

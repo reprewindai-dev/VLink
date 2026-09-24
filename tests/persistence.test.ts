@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash, generateKeyPairSync, randomBytes, sign as ed25519Sign } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { FileBackedVLinkRegistry } from "../src/server/fileBackedRegistry";
+import { createLeaseSealer } from "../src/server/leaseSealer";
+import { deviceProofPayload, deviceRequestProofPayload, parseDevicePublicKey } from "../src/server/pairingProof";
 
 const withStatePath = (fn: (statePath: string) => void) => {
   const dir = mkdtempSync(path.join(tmpdir(), "vlink-state-test-"));
@@ -103,6 +106,84 @@ test("durable state never persists plaintext enrollment, approval, device, or ac
     assert.equal(raw.includes("tokenHash"), true);
     assert.equal(raw.includes("approvalCodeHash"), true);
     assert.equal(raw.includes("deviceCodeHash"), true);
+  });
+});
+
+test("device request proof replay remains denied after durable registry restart", () => {
+  withStatePath((statePath) => {
+    const now = new Date();
+    const sealer = createLeaseSealer("ef".repeat(32));
+    assert.ok(sealer);
+    const first = new FileBackedVLinkRegistry({ statePath, leaseSealer: sealer });
+    const vlink = createLink(first);
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const deviceKey = parseDevicePublicKey(publicKey.export({ type: "spki", format: "pem" }).toString());
+    assert.ok(deviceKey);
+    const created = first.createDevicePairing(vlink.vlinkId, "https://vlink.example.test", deviceKey.pem, 600, now);
+    assert.ok(created);
+    const pairingId = created.pairing.pairingId;
+    const bootstrapSignature = ed25519Sign(null, deviceProofPayload({
+      purpose: "bootstrap",
+      vlinkId: vlink.vlinkId,
+      pairingId,
+      keyThumbprint: deviceKey.thumbprint,
+      nonce: created.challenge.nonce,
+    }), privateKey).toString("base64url");
+    assert.ok(first.verifyDevicePairingProof(vlink.vlinkId, pairingId, created.challenge.nonce, bootstrapSignature, now));
+    assert.ok(first.approvePairing(vlink.vlinkId, pairingId, undefined, now));
+
+    const exchangeChallenge = first.issueDeviceExchangeChallenge(vlink.vlinkId, pairingId, now);
+    assert.ok(exchangeChallenge);
+    const exchangeSignature = ed25519Sign(null, deviceProofPayload({
+      purpose: "exchange",
+      vlinkId: vlink.vlinkId,
+      pairingId,
+      keyThumbprint: deviceKey.thumbprint,
+      nonce: exchangeChallenge.nonce,
+    }), privateKey).toString("base64url");
+    const credential = first.exchangeDevicePairing(
+      vlink.vlinkId,
+      pairingId,
+      exchangeChallenge.nonce,
+      exchangeSignature,
+      3600,
+      now,
+    );
+    assert.ok(credential);
+    const durable = JSON.parse(readFileSync(statePath, "utf8")) as {
+      credentials: Array<{ credentialId: string; tokenHash: string }>;
+    };
+    const storedCredential = durable.credentials.find((item) => item.credentialId === credential.credentialId);
+    assert.ok(storedCredential);
+
+    const proofAt = new Date(now.getTime() + 1_000);
+    const bodyHash = createHash("sha256").update("").digest("hex");
+    const nonce = randomBytes(32).toString("base64url");
+    const signRequestProof = (requestNonce: string) => ({
+      method: "GET",
+      target: `/api/v1/vlinks/${vlink.vlinkId}/activity`,
+      host: "vlink.example.test",
+      bodyHash,
+      timestampMs: proofAt.getTime(),
+      nonce: requestNonce,
+      signature: ed25519Sign(null, deviceRequestProofPayload({
+        vlinkId: vlink.vlinkId,
+        credentialId: credential.credentialId,
+        tokenHash: storedCredential.tokenHash,
+        method: "GET",
+        target: `/api/v1/vlinks/${vlink.vlinkId}/activity`,
+        host: "vlink.example.test",
+        bodyHash,
+        timestampMs: proofAt.getTime(),
+        nonce: requestNonce,
+      }), privateKey).toString("base64url"),
+    });
+
+    const proof = signRequestProof(nonce);
+    assert.equal(first.authenticate(vlink.vlinkId, credential.token, proofAt, proof)?.status, "active");
+    const restarted = new FileBackedVLinkRegistry({ statePath, leaseSealer: sealer });
+    assert.equal(restarted.authenticate(vlink.vlinkId, credential.token, proofAt, proof), undefined);
+    assert.equal(restarted.authenticate(vlink.vlinkId, credential.token, proofAt, signRequestProof(randomBytes(32).toString("base64url")))?.status, "active");
   });
 });
 

@@ -3,10 +3,12 @@ import type {
   VLinkAccessCredential,
   VLinkAccessCredentialSummary,
   VLinkActivityEvent,
+  VLinkDeviceBootstrapView,
   VLinkEnrollmentGrant,
   VLinkEnrollmentGrantSummary,
   VLinkManifest,
   VLinkPairingRequest,
+  VLinkPairingChallenge,
   VLinkPairingStatusView,
   VLinkRecord,
   VLinkLeaseStatus,
@@ -15,6 +17,12 @@ import type {
 } from "../types/vlink";
 import { VLINK_SCHEMA_VERSION } from "../types/vlink";
 import type { LeaseSealer } from "./leaseSealer";
+import {
+  parseDevicePublicKey,
+  verifyDeviceProof,
+  verifyDeviceRequestProof,
+  type DeviceRequestProof,
+} from "./pairingProof";
 
 export interface CreateVLinkInput {
   workspaceId: string;
@@ -25,8 +33,30 @@ export interface CreateVLinkInput {
 }
 
 interface StoredPairing extends VLinkPairingStatusView {
-  approvalCodeHash: string;
-  deviceCodeHash: string;
+  approvalCodeHash?: string;
+  deviceCodeHash?: string;
+  devicePublicKeyPem?: string;
+  bootstrapChallengeHash?: string;
+  bootstrapChallengeExpiresAt?: string;
+  deviceProofVerifiedAt?: string;
+  exchangeChallenges?: Array<{ nonceHash: string; expiresAt: string }>;
+  credentialId?: string;
+  credentialSealed?: string;
+}
+
+export interface CreateDeviceBootstrapInput {
+  displayName: string;
+  environment: string;
+  sourceType: VLinkSourceType;
+}
+
+interface StoredDeviceBootstrap extends VLinkDeviceBootstrapView {
+  approvalUrl: string;
+  devicePublicKeyPem: string;
+  bootstrapChallengeHash?: string;
+  bootstrapChallengeExpiresAt?: string;
+  deviceProofVerifiedAt?: string;
+  enrollmentGrantSealed?: string;
 }
 
 interface StoredEnrollmentGrant {
@@ -44,7 +74,16 @@ interface StoredCredential {
   issuedAt: string;
   expiresAt: string;
   revokedAt?: string;
+  deviceKeyThumbprint?: string;
+  devicePublicKeyPem?: string;
 }
+
+interface StoredRequestProof {
+  proofId: string;
+  expiresAt: string;
+}
+
+const MAX_ACTIVE_REQUEST_PROOFS = 50_000;
 
 export interface StoredLease {
   leaseId: string;
@@ -97,6 +136,27 @@ export interface VLinkRegistrySnapshot {
   credentials: StoredCredential[];
   activities: Array<{ vlinkId: string; events: VLinkActivityEvent[] }>;
   leases: StoredLease[];
+  deviceBootstraps?: StoredDeviceBootstrap[];
+  bootstrapAdmissionWindows?: BootstrapAdmissionWindow[];
+  requestProofs?: StoredRequestProof[];
+}
+
+export interface BootstrapAdmissionWindow {
+  bucket: string;
+  windowStartMs: number;
+  attempts: number;
+}
+
+export interface BootstrapAdmissionPolicy {
+  perSourceLimit: number;
+  perSourceWindowSeconds: number;
+  globalLimit: number;
+  globalWindowSeconds: number;
+}
+
+export interface BootstrapAdmissionResult {
+  allowed: boolean;
+  retryAfterSeconds: number;
 }
 
 export interface VLinkRegistry {
@@ -107,10 +167,19 @@ export interface VLinkRegistry {
   issueEnrollmentGrant(vlinkId: string, ttlSeconds?: number, now?: Date): VLinkEnrollmentGrant | undefined;
   authenticateEnrollment(vlinkId: string, token: string, now?: Date): VLinkEnrollmentGrantSummary | undefined;
   createPairing(vlinkId: string, origin: string, ttlSeconds?: number, now?: Date): VLinkPairingRequest | undefined;
+  createDevicePairing(vlinkId: string, origin: string, publicKeyPem: string, ttlSeconds?: number, now?: Date): { pairing: VLinkPairingStatusView; challenge: VLinkPairingChallenge } | undefined;
+  createDeviceBootstrap(origin: string, publicKeyPem: string, input: CreateDeviceBootstrapInput, ttlSeconds?: number, now?: Date): { bootstrap: VLinkDeviceBootstrapView; challenge: VLinkPairingChallenge } | undefined;
+  consumeDeviceBootstrapAdmission(sourceFingerprint: string, policy: BootstrapAdmissionPolicy, now?: Date): BootstrapAdmissionResult;
+  verifyUnboundDeviceProof(pairingId: string, nonce: string, signature: string, now?: Date): VLinkDeviceBootstrapView | undefined;
+  getDeviceBootstrap(pairingId: string, now?: Date): VLinkDeviceBootstrapView | undefined;
+  approveDeviceBootstrap(pairingId: string, workspaceId: string, origin: string, grantTtlSeconds?: number, now?: Date): { bootstrap: VLinkDeviceBootstrapView; vlink: VLinkRecord; enrollmentGrant: VLinkEnrollmentGrant } | undefined;
+  verifyDevicePairingProof(vlinkId: string, pairingId: string, nonce: string, signature: string, now?: Date): VLinkPairingStatusView | undefined;
+  issueDeviceExchangeChallenge(vlinkId: string, pairingId: string, now?: Date): VLinkPairingChallenge | undefined;
+  exchangeDevicePairing(vlinkId: string, pairingId: string, nonce: string, signature: string, credentialTtlSeconds?: number, now?: Date): VLinkAccessCredential | undefined;
   getPairingStatus(vlinkId: string, pairingId: string, now?: Date): VLinkPairingStatusView | undefined;
-  approvePairing(vlinkId: string, pairingId: string, approvalCode: string, now?: Date): VLinkPairingStatusView | undefined;
+  approvePairing(vlinkId: string, pairingId: string, approvalCode?: string, now?: Date): VLinkPairingStatusView | undefined;
   exchangePairing(vlinkId: string, pairingId: string, deviceCode: string, credentialTtlSeconds?: number, now?: Date): VLinkAccessCredential | undefined;
-  authenticate(vlinkId: string, token: string, now?: Date): VLinkAccessCredentialSummary | undefined;
+  authenticate(vlinkId: string, token: string, now?: Date, requestProof?: DeviceRequestProof): VLinkAccessCredentialSummary | undefined;
   revokeCredential(vlinkId: string, credentialId: string, now?: Date): VLinkAccessCredentialSummary | undefined;
   configureLeaseSealer(sealer: LeaseSealer | null): void;
   bindLease(vlinkId: string, input: BindLeaseInput): VLinkLeaseView | undefined;
@@ -148,7 +217,10 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
   private readonly vlinks = new Map<string, VLinkRecord>();
   private readonly enrollmentGrants = new Map<string, StoredEnrollmentGrant>();
   private readonly pairings = new Map<string, StoredPairing>();
+  private readonly deviceBootstraps = new Map<string, StoredDeviceBootstrap>();
+  private readonly bootstrapAdmissionWindows = new Map<string, BootstrapAdmissionWindow>();
   private readonly credentials = new Map<string, StoredCredential>();
+  private readonly requestProofs = new Map<string, string>();
   private readonly leases = new Map<string, StoredLease>();
   private readonly activities = new Map<string, VLinkActivityEvent[]>();
   private leaseSealer?: LeaseSealer;
@@ -356,6 +428,378 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     };
   }
 
+  createDevicePairing(
+    vlinkId: string,
+    origin: string,
+    publicKeyPem: string,
+    ttlSeconds = 600,
+    now = new Date(),
+  ): { pairing: VLinkPairingStatusView; challenge: VLinkPairingChallenge } | undefined {
+    const vlink = this.vlinks.get(vlinkId);
+    const deviceKey = parseDevicePublicKey(publicKeyPem);
+    if (!vlink || !deviceKey) return undefined;
+
+    const pairingId = `pair_${randomBytes(24).toString("hex")}`;
+    const expiresAt = new Date(now.getTime() + Math.min(Math.max(1, ttlSeconds), 900) * 1000).toISOString();
+    const pairingUrl = `${cleanOrigin(origin)}/pair/${vlinkId}/${pairingId}`;
+    const challenge = this.newDeviceChallenge(now);
+    const stored: StoredPairing = {
+      pairingId,
+      vlinkId,
+      pairingUrl,
+      status: "pending",
+      createdAt: now.toISOString(),
+      expiresAt,
+      deviceKeyThumbprint: deviceKey.thumbprint,
+      devicePublicKeyPem: deviceKey.pem,
+      bootstrapChallengeHash: hashSecret(challenge.nonce),
+      bootstrapChallengeExpiresAt: challenge.expiresAt,
+      exchangeChallenges: [],
+    };
+    this.pairings.set(pairingId, stored);
+    vlink.enrollmentStatus = "pending";
+    vlink.updatedAt = now.toISOString();
+    return { pairing: this.publicPairing(stored), challenge };
+  }
+
+  createDeviceBootstrap(
+    origin: string,
+    publicKeyPem: string,
+    input: CreateDeviceBootstrapInput,
+    ttlSeconds = 600,
+    now = new Date(),
+  ): { bootstrap: VLinkDeviceBootstrapView; challenge: VLinkPairingChallenge } | undefined {
+    this.pruneDeviceBootstraps(now);
+    const deviceKey = parseDevicePublicKey(publicKeyPem);
+    const displayName = input.displayName.trim();
+    const environment = input.environment.trim();
+    if (
+      !deviceKey ||
+      !displayName || displayName.length > 120 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(environment) ||
+      !["ai-client", "agent-mcp", "api-service", "webhook", "local-project", "cicd", "container"].includes(input.sourceType) ||
+      Array.from(this.deviceBootstraps.values()).filter((item) => item.status === "pending" && Date.parse(item.expiresAt) > now.getTime()).length >= 500
+    ) return undefined;
+
+    const pairingId = `pair_${randomBytes(24).toString("hex")}`;
+    const expiresAt = new Date(now.getTime() + Math.min(Math.max(1, ttlSeconds), 900) * 1000).toISOString();
+    const approvalUrl = `${cleanOrigin(origin)}/pair/bootstrap/${pairingId}`;
+    const challenge = this.newDeviceChallenge(now);
+    const stored: StoredDeviceBootstrap = {
+      pairingId,
+      approvalUrl,
+      status: "pending",
+      createdAt: now.toISOString(),
+      expiresAt,
+      displayName,
+      environment,
+      sourceType: input.sourceType,
+      deviceKeyThumbprint: deviceKey.thumbprint,
+      deviceProofVerified: false,
+      devicePublicKeyPem: deviceKey.pem,
+      bootstrapChallengeHash: hashSecret(challenge.nonce),
+      bootstrapChallengeExpiresAt: challenge.expiresAt,
+    };
+    this.deviceBootstraps.set(pairingId, stored);
+    return { bootstrap: this.publicDeviceBootstrap(stored), challenge };
+  }
+
+  consumeDeviceBootstrapAdmission(
+    sourceFingerprint: string,
+    policy: BootstrapAdmissionPolicy,
+    now = new Date(),
+  ): BootstrapAdmissionResult {
+    if (!/^[a-f0-9]{64}$/.test(sourceFingerprint)) throw new Error("Invalid bootstrap source fingerprint");
+    if (
+      !Number.isSafeInteger(policy.perSourceLimit) || policy.perSourceLimit < 1 || policy.perSourceLimit > 10_000 ||
+      !Number.isSafeInteger(policy.perSourceWindowSeconds) || policy.perSourceWindowSeconds < 1 || policy.perSourceWindowSeconds > 86_400 ||
+      !Number.isSafeInteger(policy.globalLimit) || policy.globalLimit < 1 || policy.globalLimit > 100_000 ||
+      !Number.isSafeInteger(policy.globalWindowSeconds) || policy.globalWindowSeconds < 1 || policy.globalWindowSeconds > 86_400
+    ) throw new Error("Invalid anonymous bootstrap admission policy");
+
+    const sourceWindowMs = policy.perSourceWindowSeconds * 1000;
+    const globalWindowMs = policy.globalWindowSeconds * 1000;
+    const sourceWindowStartMs = Math.floor(now.getTime() / sourceWindowMs) * sourceWindowMs;
+    const globalWindowStartMs = Math.floor(now.getTime() / globalWindowMs) * globalWindowMs;
+    for (const [bucket, record] of this.bootstrapAdmissionWindows) {
+      const durationMs = bucket === "global" ? globalWindowMs : sourceWindowMs;
+      if (record.windowStartMs + durationMs <= now.getTime()) this.bootstrapAdmissionWindows.delete(bucket);
+    }
+
+    const sourceBucket = `source:${sourceFingerprint}`;
+    const globalBucket = "global";
+    const sourceWindow = this.bootstrapAdmissionWindows.get(sourceBucket);
+    const globalWindow = this.bootstrapAdmissionWindows.get(globalBucket);
+    const sourceAttempts = sourceWindow?.windowStartMs === sourceWindowStartMs ? sourceWindow.attempts : 0;
+    const globalAttempts = globalWindow?.windowStartMs === globalWindowStartMs ? globalWindow.attempts : 0;
+    const sourceRetryAfter = Math.max(1, Math.ceil((sourceWindowStartMs + sourceWindowMs - now.getTime()) / 1000));
+    const globalRetryAfter = Math.max(1, Math.ceil((globalWindowStartMs + globalWindowMs - now.getTime()) / 1000));
+
+    if (sourceAttempts >= policy.perSourceLimit) {
+      return { allowed: false, retryAfterSeconds: sourceRetryAfter };
+    }
+    if (globalAttempts >= policy.globalLimit) {
+      return { allowed: false, retryAfterSeconds: globalRetryAfter };
+    }
+    if (!sourceWindow && this.bootstrapAdmissionWindows.size >= 4_096) {
+      return { allowed: false, retryAfterSeconds: Math.max(sourceRetryAfter, globalRetryAfter) };
+    }
+
+    this.bootstrapAdmissionWindows.set(sourceBucket, {
+      bucket: sourceBucket,
+      windowStartMs: sourceWindowStartMs,
+      attempts: sourceAttempts + 1,
+    });
+    this.bootstrapAdmissionWindows.set(globalBucket, {
+      bucket: globalBucket,
+      windowStartMs: globalWindowStartMs,
+      attempts: globalAttempts + 1,
+    });
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+
+  verifyUnboundDeviceProof(
+    pairingId: string,
+    nonce: string,
+    signature: string,
+    now = new Date(),
+  ): VLinkDeviceBootstrapView | undefined {
+    const bootstrap = this.deviceBootstraps.get(pairingId);
+    if (!bootstrap) return undefined;
+    this.expireDeviceBootstrapIfNeeded(bootstrap, now);
+    if (
+      bootstrap.status !== "pending" ||
+      bootstrap.deviceProofVerifiedAt ||
+      !bootstrap.bootstrapChallengeHash ||
+      !bootstrap.bootstrapChallengeExpiresAt ||
+      Date.parse(bootstrap.bootstrapChallengeExpiresAt) <= now.getTime() ||
+      !secureHashMatch(bootstrap.bootstrapChallengeHash, nonce)
+    ) return undefined;
+    if (!verifyDeviceProof({
+      publicKeyPem: bootstrap.devicePublicKeyPem,
+      purpose: "unbound-bootstrap",
+      vlinkId: null,
+      pairingId,
+      keyThumbprint: bootstrap.deviceKeyThumbprint,
+      nonce,
+      signature,
+    })) return undefined;
+    bootstrap.deviceProofVerifiedAt = now.toISOString();
+    bootstrap.deviceProofVerified = true;
+    delete bootstrap.bootstrapChallengeHash;
+    delete bootstrap.bootstrapChallengeExpiresAt;
+    return this.publicDeviceBootstrap(bootstrap);
+  }
+
+  getDeviceBootstrap(pairingId: string, now = new Date()): VLinkDeviceBootstrapView | undefined {
+    const bootstrap = this.deviceBootstraps.get(pairingId);
+    if (!bootstrap) return undefined;
+    this.expireDeviceBootstrapIfNeeded(bootstrap, now);
+    return this.publicDeviceBootstrap(bootstrap);
+  }
+
+  approveDeviceBootstrap(
+    pairingId: string,
+    workspaceId: string,
+    origin: string,
+    grantTtlSeconds = 900,
+    now = new Date(),
+  ): { bootstrap: VLinkDeviceBootstrapView; vlink: VLinkRecord; enrollmentGrant: VLinkEnrollmentGrant } | undefined {
+    const bootstrap = this.deviceBootstraps.get(pairingId);
+    if (!bootstrap || !this.leaseSealer) return undefined;
+    this.expireDeviceBootstrapIfNeeded(bootstrap, now);
+    const normalizedWorkspaceId = workspaceId.trim();
+    if (!normalizedWorkspaceId) return undefined;
+
+    if (bootstrap.status === "approved" && bootstrap.vlinkId) {
+      const existing = this.vlinks.get(bootstrap.vlinkId);
+      if (existing?.workspaceId === normalizedWorkspaceId) {
+        const enrollmentGrant = this.recoverOrIssueBootstrapEnrollmentGrant(bootstrap, grantTtlSeconds, now);
+        if (!enrollmentGrant) return undefined;
+        return { bootstrap: this.publicDeviceBootstrap(bootstrap), vlink: structuredClone(existing), enrollmentGrant };
+      }
+      return undefined;
+    }
+    if (bootstrap.status !== "pending" || !bootstrap.deviceProofVerifiedAt || this.pairings.has(pairingId)) return undefined;
+
+    const createdVlink = this.create({
+      workspaceId: normalizedWorkspaceId,
+      displayName: bootstrap.displayName,
+      environment: bootstrap.environment,
+      sourceType: bootstrap.sourceType,
+    }, cleanOrigin(origin));
+    const vlink = this.vlinks.get(createdVlink.vlinkId)!;
+    const approvedAt = now.toISOString();
+    const pairingUrl = `${cleanOrigin(origin)}/pair/${vlink.vlinkId}/${pairingId}`;
+    this.pairings.set(pairingId, {
+      pairingId,
+      vlinkId: vlink.vlinkId,
+      pairingUrl,
+      status: "approved",
+      createdAt: bootstrap.createdAt,
+      expiresAt: bootstrap.expiresAt,
+      approvedAt,
+      deviceKeyThumbprint: bootstrap.deviceKeyThumbprint,
+      devicePublicKeyPem: bootstrap.devicePublicKeyPem,
+      deviceProofVerifiedAt: bootstrap.deviceProofVerifiedAt,
+      exchangeChallenges: [],
+    });
+    vlink.enrollmentStatus = "approved";
+    vlink.updatedAt = now.toISOString();
+    bootstrap.status = "approved";
+    bootstrap.vlinkId = vlink.vlinkId;
+    const enrollmentGrant = this.recoverOrIssueBootstrapEnrollmentGrant(bootstrap, grantTtlSeconds, now);
+    if (!enrollmentGrant) return undefined;
+    return { bootstrap: this.publicDeviceBootstrap(bootstrap), vlink: structuredClone(vlink), enrollmentGrant };
+  }
+
+  private recoverOrIssueBootstrapEnrollmentGrant(
+    bootstrap: StoredDeviceBootstrap,
+    ttlSeconds: number,
+    now: Date,
+  ): VLinkEnrollmentGrant | undefined {
+    if (!this.leaseSealer || !bootstrap.vlinkId) return undefined;
+    if (bootstrap.enrollmentGrantSealed) {
+      let stored: VLinkEnrollmentGrant;
+      try {
+        stored = JSON.parse(this.leaseSealer.open(bootstrap.enrollmentGrantSealed)) as VLinkEnrollmentGrant;
+      } catch {
+        return undefined;
+      }
+      if (
+        !stored || typeof stored !== "object" ||
+        typeof stored.grantId !== "string" || typeof stored.vlinkId !== "string" ||
+        typeof stored.token !== "string" || typeof stored.issuedAt !== "string" || typeof stored.expiresAt !== "string" ||
+        stored.vlinkId !== bootstrap.vlinkId
+      ) return undefined;
+      if (Date.parse(stored.expiresAt) > now.getTime()) {
+        return this.authenticateEnrollment(bootstrap.vlinkId, stored.token, now) ? stored : undefined;
+      }
+    }
+    const enrollmentGrant = this.issueEnrollmentGrant(bootstrap.vlinkId, ttlSeconds, now);
+    if (!enrollmentGrant) return undefined;
+    bootstrap.enrollmentGrantSealed = this.leaseSealer.seal(JSON.stringify(enrollmentGrant));
+    return enrollmentGrant;
+  }
+
+  verifyDevicePairingProof(
+    vlinkId: string,
+    pairingId: string,
+    nonce: string,
+    signature: string,
+    now = new Date(),
+  ): VLinkPairingStatusView | undefined {
+    const pairing = this.pairings.get(pairingId);
+    if (!pairing || pairing.vlinkId !== vlinkId || !pairing.devicePublicKeyPem || !pairing.deviceKeyThumbprint) return undefined;
+    this.expirePairingIfNeeded(pairing, now);
+    if (
+      pairing.status !== "pending" ||
+      !pairing.bootstrapChallengeHash ||
+      !pairing.bootstrapChallengeExpiresAt ||
+      Date.parse(pairing.bootstrapChallengeExpiresAt) <= now.getTime() ||
+      !secureHashMatch(pairing.bootstrapChallengeHash, nonce)
+    ) return undefined;
+
+    const valid = verifyDeviceProof({
+      publicKeyPem: pairing.devicePublicKeyPem,
+      purpose: "bootstrap",
+      vlinkId,
+      pairingId,
+      keyThumbprint: pairing.deviceKeyThumbprint,
+      nonce,
+      signature,
+    });
+    if (!valid) return undefined;
+    pairing.deviceProofVerifiedAt = now.toISOString();
+    delete pairing.bootstrapChallengeHash;
+    delete pairing.bootstrapChallengeExpiresAt;
+    return this.publicPairing(pairing);
+  }
+
+  issueDeviceExchangeChallenge(vlinkId: string, pairingId: string, now = new Date()): VLinkPairingChallenge | undefined {
+    const pairing = this.pairings.get(pairingId);
+    if (!pairing || pairing.vlinkId !== vlinkId || !pairing.devicePublicKeyPem || !pairing.deviceKeyThumbprint || !pairing.deviceProofVerifiedAt) return undefined;
+    this.expirePairingIfNeeded(pairing, now);
+    if (pairing.status !== "approved" && pairing.status !== "exchanged") return undefined;
+    if (pairing.status === "exchanged") {
+      const credential = pairing.credentialId ? this.credentials.get(pairing.credentialId) : undefined;
+      if (!credential || credential.revokedAt || Date.parse(credential.expiresAt) <= now.getTime() || !pairing.credentialSealed) return undefined;
+    }
+    const challenge = this.newDeviceChallenge(now);
+    const unexpired = (pairing.exchangeChallenges ?? []).filter((item) => Date.parse(item.expiresAt) > now.getTime());
+    pairing.exchangeChallenges = [...unexpired, { nonceHash: hashSecret(challenge.nonce), expiresAt: challenge.expiresAt }].slice(-4);
+    return challenge;
+  }
+
+  exchangeDevicePairing(
+    vlinkId: string,
+    pairingId: string,
+    nonce: string,
+    signature: string,
+    credentialTtlSeconds = 3600,
+    now = new Date(),
+  ): VLinkAccessCredential | undefined {
+    const pairing = this.pairings.get(pairingId);
+    const vlink = this.vlinks.get(vlinkId);
+    if (!pairing || !vlink || pairing.vlinkId !== vlinkId || !pairing.devicePublicKeyPem || !pairing.deviceKeyThumbprint || !pairing.deviceProofVerifiedAt || !this.leaseSealer) return undefined;
+    this.expirePairingIfNeeded(pairing, now);
+    if (pairing.status !== "approved" && pairing.status !== "exchanged") return undefined;
+
+    const challengeIndex = (pairing.exchangeChallenges ?? []).findIndex((item) =>
+      Date.parse(item.expiresAt) > now.getTime() && secureHashMatch(item.nonceHash, nonce),
+    );
+    if (challengeIndex < 0) return undefined;
+    if (!verifyDeviceProof({
+      publicKeyPem: pairing.devicePublicKeyPem,
+      purpose: "exchange",
+      vlinkId,
+      pairingId,
+      keyThumbprint: pairing.deviceKeyThumbprint,
+      nonce,
+      signature,
+    })) return undefined;
+    pairing.exchangeChallenges!.splice(challengeIndex, 1);
+
+    if (pairing.status === "exchanged") {
+      const stored = pairing.credentialId ? this.credentials.get(pairing.credentialId) : undefined;
+      if (!stored || stored.revokedAt || Date.parse(stored.expiresAt) <= now.getTime() || !pairing.credentialSealed) return undefined;
+      try {
+        const recovered = JSON.parse(this.leaseSealer.open(pairing.credentialSealed)) as VLinkAccessCredential;
+        if (
+          recovered.credentialId !== stored.credentialId ||
+          recovered.vlinkId !== vlinkId ||
+          recovered.issuedAt !== stored.issuedAt ||
+          recovered.expiresAt !== stored.expiresAt ||
+          !secureHashMatch(stored.tokenHash, recovered.token)
+        ) return undefined;
+        return recovered;
+      } catch {
+        return undefined;
+      }
+    }
+
+    const credential = this.issueCredential(
+      vlinkId,
+      Math.max(1, credentialTtlSeconds),
+      now,
+      pairing.deviceKeyThumbprint,
+      pairing.devicePublicKeyPem,
+    );
+    try {
+      pairing.credentialSealed = this.leaseSealer.seal(JSON.stringify(credential));
+    } catch {
+      this.credentials.delete(credential.credentialId);
+      return undefined;
+    }
+    pairing.credentialId = credential.credentialId;
+    pairing.status = "exchanged";
+    pairing.exchangedAt = now.toISOString();
+    vlink.enrollmentStatus = "paired";
+    vlink.connectionStatus = "paired";
+    vlink.updatedAt = now.toISOString();
+    return credential;
+  }
+
   getPairingStatus(vlinkId: string, pairingId: string, now = new Date()): VLinkPairingStatusView | undefined {
     const pairing = this.pairings.get(pairingId);
     if (!pairing || pairing.vlinkId !== vlinkId) return undefined;
@@ -363,12 +807,16 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     return this.publicPairing(pairing);
   }
 
-  approvePairing(vlinkId: string, pairingId: string, approvalCode: string, now = new Date()): VLinkPairingStatusView | undefined {
+  approvePairing(vlinkId: string, pairingId: string, approvalCode?: string, now = new Date()): VLinkPairingStatusView | undefined {
     const pairing = this.pairings.get(pairingId);
     const vlink = this.vlinks.get(vlinkId);
     if (!pairing || !vlink || pairing.vlinkId !== vlinkId) return undefined;
     this.expirePairingIfNeeded(pairing, now);
-    if (pairing.status !== "pending" || !secureHashMatch(pairing.approvalCodeHash, approvalCode)) return undefined;
+    const deviceBound = Boolean(pairing.devicePublicKeyPem && pairing.deviceKeyThumbprint);
+    const authorizedProof = deviceBound
+      ? Boolean(pairing.deviceProofVerifiedAt)
+      : Boolean(pairing.approvalCodeHash && pairing.deviceCodeHash && approvalCode && secureHashMatch(pairing.approvalCodeHash, approvalCode));
+    if (pairing.status !== "pending" || !authorizedProof) return undefined;
 
     pairing.status = "approved";
     pairing.approvedAt = now.toISOString();
@@ -388,7 +836,7 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     const vlink = this.vlinks.get(vlinkId);
     if (!pairing || !vlink || pairing.vlinkId !== vlinkId) return undefined;
     this.expirePairingIfNeeded(pairing, now);
-    if (pairing.status !== "approved" || !secureHashMatch(pairing.deviceCodeHash, deviceCode)) return undefined;
+    if (pairing.status !== "approved" || !pairing.deviceCodeHash || !secureHashMatch(pairing.deviceCodeHash, deviceCode)) return undefined;
 
     const credential = this.issueCredential(vlinkId, Math.max(1, credentialTtlSeconds), now);
     pairing.status = "exchanged";
@@ -399,7 +847,7 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     return credential;
   }
 
-  authenticate(vlinkId: string, token: string, now = new Date()): VLinkAccessCredentialSummary | undefined {
+  authenticate(vlinkId: string, token: string, now = new Date(), requestProof?: DeviceRequestProof): VLinkAccessCredentialSummary | undefined {
     const match = /^vlt_([a-f0-9]{16})\.([A-Za-z0-9_-]+)$/.exec(token);
     if (!match) return undefined;
     const credentialId = `cred_${match[1]}`;
@@ -407,6 +855,22 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     if (!credential || credential.vlinkId !== vlinkId || credential.revokedAt) return undefined;
     if (new Date(credential.expiresAt).getTime() <= now.getTime()) return undefined;
     if (!secureHashMatch(credential.tokenHash, token)) return undefined;
+    if (credential.deviceKeyThumbprint || credential.devicePublicKeyPem) {
+      if (
+        !credential.deviceKeyThumbprint ||
+        !credential.devicePublicKeyPem ||
+        !requestProof ||
+        !verifyDeviceRequestProof({
+          publicKeyPem: credential.devicePublicKeyPem,
+          vlinkId,
+          credentialId: credential.credentialId,
+          tokenHash: credential.tokenHash,
+          proof: requestProof,
+          now,
+        }) ||
+        !this.consumeRequestProof(credential.credentialId, requestProof.nonce, requestProof.timestampMs, now)
+      ) return undefined;
+    }
     return this.credentialSummary(credential, now);
   }
 
@@ -443,7 +907,10 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     this.vlinks.clear();
     this.enrollmentGrants.clear();
     this.pairings.clear();
+    this.deviceBootstraps.clear();
+    this.bootstrapAdmissionWindows.clear();
     this.credentials.clear();
+    this.requestProofs.clear();
     this.leases.clear();
     this.activities.clear();
   }
@@ -460,6 +927,9 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
         events: events.map((event) => structuredClone(event)),
       })),
       leases: Array.from(this.leases.values()).map((lease) => structuredClone(lease)),
+      deviceBootstraps: Array.from(this.deviceBootstraps.values()).map((item) => structuredClone(item)),
+      bootstrapAdmissionWindows: Array.from(this.bootstrapAdmissionWindows.values()).map((item) => structuredClone(item)),
+      requestProofs: Array.from(this.requestProofs.entries()).map(([proofId, expiresAt]) => ({ proofId, expiresAt })),
     };
   }
 
@@ -473,8 +943,28 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     const credentials = value.credentials;
     const activities = value.activities;
     const leases = value.leases ?? [];
-    if (!Array.isArray(vlinks) || !Array.isArray(enrollmentGrants) || !Array.isArray(pairings) || !Array.isArray(credentials) || !Array.isArray(activities) || !Array.isArray(leases)) {
+    const deviceBootstraps = value.deviceBootstraps ?? [];
+    const bootstrapAdmissionWindows = value.bootstrapAdmissionWindows ?? [];
+    const requestProofs = value.requestProofs ?? [];
+    if (!Array.isArray(vlinks) || !Array.isArray(enrollmentGrants) || !Array.isArray(pairings) || !Array.isArray(credentials) || !Array.isArray(activities) || !Array.isArray(leases) || !Array.isArray(deviceBootstraps) || !Array.isArray(bootstrapAdmissionWindows) || !Array.isArray(requestProofs)) {
       throw new Error("Invalid durable VLink state: malformed collections");
+    }
+
+    const nextBootstrapAdmissionWindows = new Map<string, BootstrapAdmissionWindow>();
+    for (const item of bootstrapAdmissionWindows) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: bootstrap admission window");
+      assertString(item.bucket, "bootstrapAdmission.bucket");
+      if (item.bucket !== "global" && !/^source:[a-f0-9]{64}$/.test(item.bucket)) {
+        throw new Error("Invalid durable VLink state: bootstrap admission bucket");
+      }
+      if (!Number.isSafeInteger(item.windowStartMs) || Number(item.windowStartMs) < 0) {
+        throw new Error("Invalid durable VLink state: bootstrap admission window start");
+      }
+      if (!Number.isSafeInteger(item.attempts) || Number(item.attempts) < 1 || Number(item.attempts) > 100_000) {
+        throw new Error("Invalid durable VLink state: bootstrap admission attempts");
+      }
+      if (nextBootstrapAdmissionWindows.has(item.bucket)) throw new Error("Invalid durable VLink state: duplicate bootstrap admission bucket");
+      nextBootstrapAdmissionWindows.set(item.bucket, structuredClone(item as unknown as BootstrapAdmissionWindow));
     }
 
     const nextVlinks = new Map<string, VLinkRecord>();
@@ -510,12 +1000,94 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       if (!isObject(item)) throw new Error("Invalid durable VLink state: pairing");
       assertString(item.pairingId, "pairingId");
       known(item.vlinkId, "pairing.vlinkId");
-      assertHash(item.approvalCodeHash, "pairing.approvalCodeHash");
-      assertHash(item.deviceCodeHash, "pairing.deviceCodeHash");
+      if (item.approvalCodeHash !== undefined) assertHash(item.approvalCodeHash, "pairing.approvalCodeHash");
+      if (item.deviceCodeHash !== undefined) assertHash(item.deviceCodeHash, "pairing.deviceCodeHash");
+      if ((item.approvalCodeHash === undefined) !== (item.deviceCodeHash === undefined)) {
+        throw new Error("Invalid durable VLink state: incomplete legacy pairing secrets");
+      }
+      if (item.devicePublicKeyPem !== undefined) {
+        assertString(item.devicePublicKeyPem, "pairing.devicePublicKeyPem");
+        const parsedKey = parseDevicePublicKey(item.devicePublicKeyPem);
+        if (!parsedKey || parsedKey.pem !== item.devicePublicKeyPem) throw new Error("Invalid durable VLink state: device public key");
+      }
+      if (item.deviceKeyThumbprint !== undefined) {
+        assertString(item.deviceKeyThumbprint, "pairing.deviceKeyThumbprint");
+        if (!/^[A-Za-z0-9_-]{43}$/.test(item.deviceKeyThumbprint)) throw new Error("Invalid durable VLink state: device key thumbprint");
+      }
+      if (item.bootstrapChallengeHash !== undefined) assertHash(item.bootstrapChallengeHash, "pairing.bootstrapChallengeHash");
+      if (item.bootstrapChallengeExpiresAt !== undefined) assertString(item.bootstrapChallengeExpiresAt, "pairing.bootstrapChallengeExpiresAt");
+      if (item.deviceProofVerifiedAt !== undefined) assertString(item.deviceProofVerifiedAt, "pairing.deviceProofVerifiedAt");
+      if (item.exchangeChallenges !== undefined) {
+        if (!Array.isArray(item.exchangeChallenges)) throw new Error("Invalid durable VLink state: exchange challenges");
+        for (const challenge of item.exchangeChallenges) {
+          if (!isObject(challenge)) throw new Error("Invalid durable VLink state: exchange challenge");
+          assertHash(challenge.nonceHash, "pairing.exchangeChallenge.nonceHash");
+          assertString(challenge.expiresAt, "pairing.exchangeChallenge.expiresAt");
+        }
+      }
+      if (item.credentialId !== undefined) assertString(item.credentialId, "pairing.credentialId");
+      if (item.credentialSealed !== undefined) assertString(item.credentialSealed, "pairing.credentialSealed");
+      if ((item.credentialId === undefined) !== (item.credentialSealed === undefined)) {
+        throw new Error("Invalid durable VLink state: incomplete recoverable credential");
+      }
+      if (item.devicePublicKeyPem !== undefined && !item.deviceKeyThumbprint) {
+        throw new Error("Invalid durable VLink state: incomplete device key binding");
+      }
+      if (item.devicePublicKeyPem === undefined && (!item.approvalCodeHash || !item.deviceCodeHash)) {
+        throw new Error("Invalid durable VLink state: pairing has no authentication material");
+      }
       assertString(item.createdAt, "pairing.createdAt");
       assertString(item.expiresAt, "pairing.expiresAt");
       if (nextPairings.has(item.pairingId)) throw new Error("Invalid durable VLink state: duplicate pairingId");
       nextPairings.set(item.pairingId, structuredClone(item as unknown as StoredPairing));
+    }
+
+    const nextDeviceBootstraps = new Map<string, StoredDeviceBootstrap>();
+    for (const item of deviceBootstraps) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: device bootstrap");
+      assertString(item.pairingId, "deviceBootstrap.pairingId");
+      if (!/^pair_[a-f0-9]{48}$/.test(item.pairingId)) throw new Error("Invalid durable VLink state: deviceBootstrap.pairingId");
+      assertString(item.approvalUrl, "deviceBootstrap.approvalUrl");
+      assertString(item.createdAt, "deviceBootstrap.createdAt");
+      assertString(item.expiresAt, "deviceBootstrap.expiresAt");
+      assertString(item.displayName, "deviceBootstrap.displayName");
+      assertString(item.environment, "deviceBootstrap.environment");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(item.environment)) throw new Error("Invalid durable VLink state: deviceBootstrap.environment");
+      if (![
+        "ai-client", "agent-mcp", "api-service", "webhook", "local-project", "cicd", "container",
+      ].includes(String(item.sourceType))) throw new Error("Invalid durable VLink state: deviceBootstrap.sourceType");
+      if (!["pending", "approved", "expired"].includes(String(item.status))) throw new Error("Invalid durable VLink state: deviceBootstrap.status");
+      assertString(item.deviceKeyThumbprint, "deviceBootstrap.deviceKeyThumbprint");
+      if (!/^[A-Za-z0-9_-]{43}$/.test(item.deviceKeyThumbprint)) throw new Error("Invalid durable VLink state: deviceBootstrap.deviceKeyThumbprint");
+      assertString(item.devicePublicKeyPem, "deviceBootstrap.devicePublicKeyPem");
+      if (item.enrollmentGrantSealed !== undefined) assertString(item.enrollmentGrantSealed, "deviceBootstrap.enrollmentGrantSealed");
+      const bootstrapKey = parseDevicePublicKey(item.devicePublicKeyPem);
+      if (!bootstrapKey || bootstrapKey.pem !== item.devicePublicKeyPem || bootstrapKey.thumbprint !== item.deviceKeyThumbprint) {
+        throw new Error("Invalid durable VLink state: device bootstrap public key");
+      }
+      if (typeof item.deviceProofVerified !== "boolean") throw new Error("Invalid durable VLink state: deviceBootstrap.deviceProofVerified");
+      if (item.bootstrapChallengeHash !== undefined) assertHash(item.bootstrapChallengeHash, "deviceBootstrap.challengeHash");
+      if (item.bootstrapChallengeExpiresAt !== undefined) assertString(item.bootstrapChallengeExpiresAt, "deviceBootstrap.challengeExpiresAt");
+      if (item.deviceProofVerifiedAt !== undefined) assertString(item.deviceProofVerifiedAt, "deviceBootstrap.deviceProofVerifiedAt");
+      if (item.deviceProofVerified !== Boolean(item.deviceProofVerifiedAt)) throw new Error("Invalid durable VLink state: device bootstrap proof state");
+      if (item.vlinkId !== undefined) known(item.vlinkId, "deviceBootstrap.vlinkId");
+      if (item.status === "approved" && item.vlinkId === undefined) throw new Error("Invalid durable VLink state: approved bootstrap has no VLink");
+      if (item.status !== "approved" && item.vlinkId !== undefined) throw new Error("Invalid durable VLink state: unapproved bootstrap has a VLink");
+      if (item.status === "pending" && !item.deviceProofVerified && !item.bootstrapChallengeHash) {
+        throw new Error("Invalid durable VLink state: pending bootstrap has no proof challenge");
+      }
+      if (nextDeviceBootstraps.has(item.pairingId)) throw new Error("Invalid durable VLink state: duplicate device bootstrap");
+      nextDeviceBootstraps.set(item.pairingId, structuredClone(item as unknown as StoredDeviceBootstrap));
+    }
+    for (const item of nextDeviceBootstraps.values()) {
+      if (item.status === "approved") {
+        const pairing = nextPairings.get(item.pairingId);
+        if (!pairing || pairing.vlinkId !== item.vlinkId || pairing.deviceKeyThumbprint !== item.deviceKeyThumbprint || !pairing.deviceProofVerifiedAt) {
+          throw new Error("Invalid durable VLink state: approved bootstrap pairing mismatch");
+        }
+      } else if (nextPairings.has(item.pairingId)) {
+        throw new Error("Invalid durable VLink state: unapproved bootstrap has a bound pairing");
+      }
     }
 
     const nextCredentials = new Map<string, StoredCredential>();
@@ -527,8 +1099,37 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       assertString(item.issuedAt, "credential.issuedAt");
       assertString(item.expiresAt, "credential.expiresAt");
       if (item.revokedAt !== undefined) assertString(item.revokedAt, "credential.revokedAt");
+      if (item.deviceKeyThumbprint !== undefined) {
+        assertString(item.deviceKeyThumbprint, "credential.deviceKeyThumbprint");
+        if (!/^[A-Za-z0-9_-]{43}$/.test(item.deviceKeyThumbprint)) throw new Error("Invalid durable VLink state: credential device key thumbprint");
+      }
+      if (item.devicePublicKeyPem !== undefined) {
+        assertString(item.devicePublicKeyPem, "credential.devicePublicKeyPem");
+        const credentialKey = parseDevicePublicKey(item.devicePublicKeyPem);
+        if (!credentialKey || credentialKey.pem !== item.devicePublicKeyPem || credentialKey.thumbprint !== item.deviceKeyThumbprint) {
+          throw new Error("Invalid durable VLink state: credential device public key");
+        }
+      }
+      // Older canary credentials may have a thumbprint but no persisted public key. Keep the
+      // registry loadable, but authenticate() rejects them because their PoP key is unavailable.
+      if (item.devicePublicKeyPem !== undefined && item.deviceKeyThumbprint === undefined) {
+        throw new Error("Invalid durable VLink state: incomplete credential device key binding");
+      }
       if (nextCredentials.has(item.credentialId)) throw new Error("Invalid durable VLink state: duplicate credentialId");
       nextCredentials.set(item.credentialId, structuredClone(item as unknown as StoredCredential));
+    }
+
+    if (requestProofs.length > MAX_ACTIVE_REQUEST_PROOFS) {
+      throw new Error("Invalid durable VLink state: too many request proof replay records");
+    }
+    const nextRequestProofs = new Map<string, string>();
+    for (const item of requestProofs) {
+      if (!isObject(item)) throw new Error("Invalid durable VLink state: request proof replay record");
+      assertHash(item.proofId, "requestProof.proofId");
+      assertString(item.expiresAt, "requestProof.expiresAt");
+      if (!Number.isFinite(Date.parse(item.expiresAt))) throw new Error("Invalid durable VLink state: request proof expiry");
+      if (nextRequestProofs.has(item.proofId)) throw new Error("Invalid durable VLink state: duplicate request proof");
+      nextRequestProofs.set(item.proofId, item.expiresAt);
     }
 
     const nextActivities = new Map<string, VLinkActivityEvent[]>();
@@ -585,7 +1186,10 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     for (const [key, item] of nextVlinks) this.vlinks.set(key, item);
     for (const [key, item] of nextGrants) this.enrollmentGrants.set(key, item);
     for (const [key, item] of nextPairings) this.pairings.set(key, item);
+    for (const [key, item] of nextDeviceBootstraps) this.deviceBootstraps.set(key, item);
+    for (const [key, item] of nextBootstrapAdmissionWindows) this.bootstrapAdmissionWindows.set(key, item);
     for (const [key, item] of nextCredentials) this.credentials.set(key, item);
+    for (const [key, expiresAt] of nextRequestProofs) this.requestProofs.set(key, expiresAt);
     for (const [key, item] of nextLeases) this.leases.set(key, item);
     for (const [key, item] of nextActivities) this.activities.set(key, item);
   }
@@ -614,7 +1218,13 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     };
   }
 
-  private issueCredential(vlinkId: string, ttlSeconds: number, now: Date): VLinkAccessCredential {
+  private issueCredential(
+    vlinkId: string,
+    ttlSeconds: number,
+    now: Date,
+    deviceKeyThumbprint?: string,
+    devicePublicKeyPem?: string,
+  ): VLinkAccessCredential {
     const id = randomBytes(8).toString("hex");
     const credentialId = `cred_${id}`;
     const secret = randomBytes(32).toString("base64url");
@@ -627,6 +1237,8 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       tokenHash: hashSecret(token),
       issuedAt,
       expiresAt,
+      ...(deviceKeyThumbprint ? { deviceKeyThumbprint } : {}),
+      ...(devicePublicKeyPem ? { devicePublicKeyPem } : {}),
     });
     return { credentialId, vlinkId, token, issuedAt, expiresAt };
   }
@@ -641,6 +1253,55 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       expiresAt: pairing.expiresAt,
       ...(pairing.approvedAt ? { approvedAt: pairing.approvedAt } : {}),
       ...(pairing.exchangedAt ? { exchangedAt: pairing.exchangedAt } : {}),
+      ...(pairing.deviceKeyThumbprint ? { deviceKeyThumbprint: pairing.deviceKeyThumbprint } : {}),
+      ...(pairing.devicePublicKeyPem ? { deviceProofVerified: Boolean(pairing.deviceProofVerifiedAt) } : {}),
+    };
+  }
+
+  private consumeRequestProof(credentialId: string, nonce: string, timestampMs: number, now: Date): boolean {
+    for (const [proofId, expiresAt] of this.requestProofs) {
+      if (Date.parse(expiresAt) <= now.getTime()) this.requestProofs.delete(proofId);
+    }
+    const proofId = hashSecret(`${credentialId}\0${nonce}`);
+    if (this.requestProofs.has(proofId) || this.requestProofs.size >= MAX_ACTIVE_REQUEST_PROOFS) return false;
+    this.requestProofs.set(proofId, new Date(timestampMs + 120_000).toISOString());
+    return true;
+  }
+
+  private publicDeviceBootstrap(bootstrap: StoredDeviceBootstrap): VLinkDeviceBootstrapView {
+    return {
+      pairingId: bootstrap.pairingId,
+      approvalUrl: bootstrap.approvalUrl,
+      status: bootstrap.status,
+      createdAt: bootstrap.createdAt,
+      expiresAt: bootstrap.expiresAt,
+      displayName: bootstrap.displayName,
+      environment: bootstrap.environment,
+      sourceType: bootstrap.sourceType,
+      deviceKeyThumbprint: bootstrap.deviceKeyThumbprint,
+      deviceProofVerified: bootstrap.deviceProofVerified,
+      ...(bootstrap.vlinkId ? { vlinkId: bootstrap.vlinkId } : {}),
+    };
+  }
+
+  private expireDeviceBootstrapIfNeeded(bootstrap: StoredDeviceBootstrap, now: Date): void {
+    if (bootstrap.status === "pending" && Date.parse(bootstrap.expiresAt) <= now.getTime()) {
+      bootstrap.status = "expired";
+    }
+  }
+
+  private pruneDeviceBootstraps(now: Date): void {
+    const retentionMs = 24 * 60 * 60 * 1000;
+    for (const [pairingId, bootstrap] of this.deviceBootstraps) {
+      this.expireDeviceBootstrapIfNeeded(bootstrap, now);
+      if (Date.parse(bootstrap.createdAt) + retentionMs <= now.getTime()) this.deviceBootstraps.delete(pairingId);
+    }
+  }
+
+  private newDeviceChallenge(now: Date): VLinkPairingChallenge {
+    return {
+      nonce: randomBytes(32).toString("base64url"),
+      expiresAt: new Date(now.getTime() + 120_000).toISOString(),
     };
   }
 

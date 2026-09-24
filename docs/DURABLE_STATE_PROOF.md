@@ -8,7 +8,7 @@
 
 - Production requires `VLINK_STATE_PATH`; startup fails closed if it is missing.
 - Durable state is written outside source control under a configured persistent path.
-- Enrollment grants, browser approval secrets, device exchange secrets, and workload access tokens are persisted only as SHA-256 hashes.
+- Normal enrollment grants, browser approval secrets, device exchange secrets, and workload access tokens are persisted only as SHA-256 hashes. The anonymous-bootstrap owner's enrollment grant is the explicit recovery exception: its token is AES-GCM sealed at rest, while the normal hashed grant record still authenticates it.
 - Mutations are committed to a same-directory temporary file, synced through a writable file descriptor, and renamed into place.
 - If durable persistence fails, the in-memory registry is restored to its previous snapshot and the mutation fails rather than reporting success.
 - Loading fails closed on corrupt/unsupported state, duplicate identities, invalid hashes, and orphaned cross-VLink references.
@@ -25,6 +25,8 @@ Seven persistence falsifiers verify:
 5. Corrupt and unsupported state fail closed.
 6. Orphaned cross-VLink credential state is rejected before use.
 7. Durable clear does not resurrect deleted runtime state.
+
+The current local canary adds a process-restart test for recovering the same bootstrap-created owner grant after a lost response. That addition is not covered by the historical CI run listed below; it requires the current canary CI run before it can be called CI-verified.
 
 ## Cross-platform proof
 

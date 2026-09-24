@@ -1,5 +1,6 @@
 import type { Express, Request, Response } from "express";
 import type { VLinkRegistry } from "./vlinkRegistry";
+import { authenticateVLinkRequest } from "./requestProof";
 
 export type VLinkFailoverAttemptOutcome = "success" | "upstream_4xx" | "upstream_5xx" | "timeout" | "transport_error";
 
@@ -169,7 +170,7 @@ export const installFailoverSupport = (
       res.setHeader("WWW-Authenticate", 'Bearer realm="VLink failover"');
       return res.status(401).json({ error: "vlink_access_token_required" });
     }
-    const credential = registry.authenticate(vlink.vlinkId, token);
+    const credential = authenticateVLinkRequest(registry, req, vlink.vlinkId, token);
     if (!credential) {
       res.setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
       return res.status(401).json({ error: "invalid_or_expired_vlink_access_token" });
