@@ -62,6 +62,34 @@ before(async () => {
   targetBase = `http://127.0.0.1:${(targetServer.address() as AddressInfo).port}`;
 });
 
+test("health reports the configured registry persistence adapter", async () => {
+  const memoryResponse = await fetch(`${base}/api/health`);
+  assert.equal(memoryResponse.status, 200);
+  const memoryHealth = await memoryResponse.json() as { persistence: string };
+  assert.equal(memoryHealth.persistence, "memory");
+
+  const stateDir = mkdtempSync(path.join(tmpdir(), "vlink-health-persistence-"));
+  const fileApp = createApp({
+    registry: new FileBackedVLinkRegistry({
+      statePath: path.join(stateDir, "state.json"),
+      leaseSealer: createLeaseSealer("cd".repeat(32)),
+    }),
+    leaseSealer: createLeaseSealer("cd".repeat(32)),
+  }).app;
+  const fileServer = fileApp.listen(0, "127.0.0.1");
+  try {
+    await new Promise<void>((resolve) => fileServer.once("listening", resolve));
+    const address = fileServer.address() as AddressInfo;
+    const fileResponse = await fetch(`http://127.0.0.1:${address.port}/api/health`);
+    assert.equal(fileResponse.status, 200);
+    const fileHealth = await fileResponse.json() as { persistence: string };
+    assert.equal(fileHealth.persistence, "file");
+  } finally {
+    await new Promise<void>((resolve, reject) => fileServer.close((error) => error ? reject(error) : resolve()));
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 after(async () => {
   await Promise.all([
     new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),

@@ -160,6 +160,8 @@ export interface BootstrapAdmissionResult {
 }
 
 export interface VLinkRegistry {
+  /** Storage adapter actually backing this registry, for truthful readiness reporting. */
+  readonly persistenceMode?: "memory" | "file" | "external";
   create(input: CreateVLinkInput, origin: string): VLinkRecord;
   list(): VLinkRecord[];
   get(vlinkId: string): VLinkRecord | undefined;
@@ -214,6 +216,7 @@ const assertHash: (value: unknown, field: string) => asserts value is string = (
 };
 
 export class InMemoryVLinkRegistry implements VLinkRegistry {
+  readonly persistenceMode = "memory" as const;
   private readonly vlinks = new Map<string, VLinkRecord>();
   private readonly enrollmentGrants = new Map<string, StoredEnrollmentGrant>();
   private readonly pairings = new Map<string, StoredPairing>();
