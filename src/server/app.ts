@@ -378,7 +378,7 @@ export function createApp(options: CreateAppOptions = {}) {
       unauthenticatedCreateEnabled: allowUnauthenticatedCreate,
       anonymousBootstrapEnabled: enableAnonymousBootstrap,
       workspaceAuthConfigured: Boolean(workspaceAuthenticator),
-      persistence: "memory",
+      persistence: registry.persistenceMode ?? "unknown",
       leaseSealing: Boolean(leaseSealer),
       capiConfigured: Boolean(process.env.VLINK_CAPI_BASE_URL?.trim()),
       timestamp: new Date().toISOString(),

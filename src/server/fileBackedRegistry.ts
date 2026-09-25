@@ -46,6 +46,7 @@ export interface FileBackedVLinkRegistryOptions {
 const stableJson = (snapshot: VLinkRegistrySnapshot) => `${JSON.stringify(snapshot, null, 2)}\n`;
 
 export class FileBackedVLinkRegistry implements VLinkRegistry {
+  readonly persistenceMode = "file" as const;
   private readonly inner: InMemoryVLinkRegistry;
   private readonly statePath: string;
 
