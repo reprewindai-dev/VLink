@@ -1,6 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { GoogleGenAI } from "@google/genai";
 import { InMemoryVLinkRegistry, type VLinkRegistry } from "./vlinkRegistry";
+import { installAnalyticsProxy } from "./analyticsProxy";
 import type { VLinkAccessCredentialSummary, VLinkSourceType } from "../types/vlink";
 
 export interface CreateAppOptions {
@@ -909,6 +910,8 @@ export function createApp(options: CreateAppOptions = {}) {
       message: "VLink publishes an MCP endpoint placeholder; full MCP transport is not implemented in this release.",
     });
   });
+
+  installAnalyticsProxy(app, { lockerPhycerBaseUrl: lockerPhycerBaseUrl || undefined });
 
   app.use(["/api", "/v1", "/mcp", "/vlinks"], (_req, res) => res.status(404).json({ error: "not_found" }));
 

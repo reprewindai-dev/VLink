@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 import { CheckCircle2, Copy, Link2, Play, QrCode, ShieldCheck, Unplug } from "lucide-react";
 import { readAccountToken, resolveOwnedWorkspace, type OwnedWorkspace } from "./account-session";
+import { noteSignedIn, track } from "./analytics/tracker";
 import type {
   VLinkAccessCredential,
   VLinkActivityEvent,
@@ -93,6 +94,20 @@ export default function App() {
         setError(message);
       });
   }, []);
+
+  // Funnel analytics: the connect screen was reached (once per page load), and a
+  // signed-in tab links its anonymous analytics id to the workspace.
+  const isConnectScreen =
+    !/^\/pair\/[^/]+\/[^/]+$/.test(window.location.pathname) && !window.location.pathname.endsWith("/authorize");
+  const [connectViewTracked, setConnectViewTracked] = useState(false);
+  useEffect(() => {
+    if (!isConnectScreen || connectViewTracked || workspaceState === "loading") return;
+    setConnectViewTracked(true);
+    track("vlink_connect_viewed", {
+      state: workspaceState === "ready" ? "signed_in" : workspaceState === "signed-out" ? "signed_out" : "unknown",
+    });
+    if (workspaceState === "ready") noteSignedIn(readAccountToken(window.localStorage));
+  }, [isConnectScreen, connectViewTracked, workspaceState]);
 
   const pairingTarget = useMemo(() => {
     const match = window.location.pathname.match(/^\/pair\/([^/]+)\/([^/]+)$/);
@@ -417,7 +432,7 @@ export default function App() {
             /></label>
             <label>Environment<select value={environment} onChange={(e) => setEnvironment(e.target.value)}><option>development</option><option>staging</option><option>production</option></select></label>
           </div>
-          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" href={`${accountOrigin}/login?returnTo=%2Fvlink%2Fconnect%2F`}>Sign in →</a> New here? <a className="manifest" href={`${accountOrigin}/signup?returnTo=%2Fvlink%2Fconnect%2F`}>Start your free trial →</a></div>}
+          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" data-analytics-cta="vlink-sign-in" href={`${accountOrigin}/login?returnTo=%2Fvlink%2Fconnect%2F`}>Sign in →</a> New here? <a className="manifest" data-analytics-cta="vlink-start-free-trial" href={`${accountOrigin}/signup?returnTo=%2Fvlink%2Fconnect%2F`}>Start your free trial →</a></div>}
           {workspaceState === "missing" && <div className="error">Finish Capability OS onboarding to bind a workspace before creating a VLink. <a className="manifest" href="/os/onboarding">Continue onboarding →</a></div>}
           {workspaceState === "failed" && <div className="error">VLink could not verify your workspace. Refresh after the identity service is available.</div>}
           <label>What are you linking?<select value={sourceType} onChange={(e) => setSourceType(e.target.value as VLinkSourceType)}>{sourceOptions.map((o) => <option value={o.value} key={o.value}>{o.label}</option>)}</select></label>
