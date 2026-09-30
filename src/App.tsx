@@ -26,6 +26,10 @@ const apiOrigin = ["veklom.com", "www.veklom.com"].includes(window.location.host
   ? "https://vlink.veklom.com"
   : "";
 
+// Sign-in and signup live on the veklom.com frontend; on vlink.veklom.com a relative
+// link would land in this app's own catch-all instead.
+const accountOrigin = window.location.hostname === "vlink.veklom.com" ? "https://veklom.com" : "";
+
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const headers = new Headers(init?.headers);
   headers.set("content-type", "application/json");
@@ -324,7 +328,7 @@ export default function App() {
 
   if (pairingTarget) {
     const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    const loginHref = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+    const loginHref = `${accountOrigin}/login?returnTo=${encodeURIComponent(returnTo)}`;
     return (
       <main className="shell">
         <section className="hero">
@@ -354,7 +358,7 @@ export default function App() {
 
   if (deviceAuthorizationTarget !== null) {
     const returnTo = `${window.location.pathname}${window.location.search}`;
-    const loginHref = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+    const loginHref = `${accountOrigin}/login?returnTo=${encodeURIComponent(returnTo)}`;
     return (
       <main className="shell">
         <section className="hero">
@@ -413,7 +417,7 @@ export default function App() {
             /></label>
             <label>Environment<select value={environment} onChange={(e) => setEnvironment(e.target.value)}><option>development</option><option>staging</option><option>production</option></select></label>
           </div>
-          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" href="/login?returnTo=%2Fvlink%2Fconnect%2F">Sign in →</a> New here? <a className="manifest" href="/signup?returnTo=%2Fvlink%2Fconnect%2F">Start your free trial →</a></div>}
+          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" href={`${accountOrigin}/login?returnTo=%2Fvlink%2Fconnect%2F`}>Sign in →</a> New here? <a className="manifest" href={`${accountOrigin}/signup?returnTo=%2Fvlink%2Fconnect%2F`}>Start your free trial →</a></div>}
           {workspaceState === "missing" && <div className="error">Finish Capability OS onboarding to bind a workspace before creating a VLink. <a className="manifest" href="/os/onboarding">Continue onboarding →</a></div>}
           {workspaceState === "failed" && <div className="error">VLink could not verify your workspace. Refresh after the identity service is available.</div>}
           <label>What are you linking?<select value={sourceType} onChange={(e) => setSourceType(e.target.value as VLinkSourceType)}>{sourceOptions.map((o) => <option value={o.value} key={o.value}>{o.label}</option>)}</select></label>
