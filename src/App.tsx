@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
-import { CheckCircle2, Copy, Link2, Play, QrCode, ShieldCheck, Unplug } from "lucide-react";
-import { readAccountToken, resolveOwnedWorkspace, type OwnedWorkspace } from "./account-session";
+import { CheckCircle2, Copy, Link2, Play, QrCode, ShieldCheck, Unplug, Wallet } from "lucide-react";
+import {
+  readAccountToken,
+  resolveOwnedWorkspace,
+  resolveWorkspaceWallet,
+  shortWalletAddress,
+  type OwnedWorkspace,
+  type WorkspaceWalletLookup,
+} from "./account-session";
 import type {
   VLinkAccessCredential,
   VLinkActivityEvent,
@@ -75,6 +82,7 @@ export default function App() {
     expiresAt: string;
   } | null>(null);
   const [deviceAuthorizationDecision, setDeviceAuthorizationDecision] = useState<"idle" | "approved" | "denied" | "failed">("idle");
+  const [walletLookup, setWalletLookup] = useState<WorkspaceWalletLookup | null>(null);
 
   useEffect(() => {
     const accountToken = readAccountToken(window.localStorage);
@@ -86,6 +94,8 @@ export default function App() {
       .then((resolvedWorkspace) => {
         setWorkspace(resolvedWorkspace);
         setWorkspaceState("ready");
+        // Reuse the workspace wallet; onboarding is never repeated per connection.
+        return resolveWorkspaceWallet(accountToken).then(setWalletLookup);
       })
       .catch((cause: unknown) => {
         const message = cause instanceof Error ? cause.message : "Workspace lookup failed";
@@ -404,9 +414,23 @@ export default function App() {
         <div className="truthBadge"><ShieldCheck size={16}/> Activity records are metadata, not cryptographic receipts.</div>
       </section>
 
+      <ol className="flowSteps" aria-label="VLink flow">
+        {[
+          { label: "Connect", done: Boolean(vlink) },
+          { label: "Wallet", done: walletLookup?.status === "bound" },
+          { label: "Authorize", done: Boolean(credential) },
+          { label: "Execute", done: activity.length > 0 },
+          { label: "Receipt", done: activity.length > 0 },
+        ].map((stage, index) => (
+          <li key={stage.label} className={stage.done ? "done" : undefined}>
+            {stage.done ? <CheckCircle2 size={14}/> : <span className="stepIndex">{index + 1}</span>} {stage.label}
+          </li>
+        ))}
+      </ol>
+
       <section className="grid two">
         <article className="card">
-          <div className="eyebrow">1 · CREATE</div>
+          <div className="eyebrow">1 · CONNECT</div>
           <h2>Create a VLink</h2>
           <label>Name<input value={displayName} onChange={(e) => setDisplayName(e.target.value)} /></label>
           <div className="grid two compact">
@@ -426,7 +450,7 @@ export default function App() {
         </article>
 
         <article className="card">
-          <div className="eyebrow">2 · CONNECT</div>
+          <div className="eyebrow">3 · AUTHORIZE → 4 · EXECUTE</div>
           <h2>{vlink ? (credential ? "Your VLink is connected" : "Approve this VLink") : "Connection instructions appear here"}</h2>
           {!vlink ? <p className="muted">No credentials or setup snippets are generated until you create a VLink.</p> : <>
             <div className="statusRow"><span className="pill observe">OBSERVE</span><code>{vlink.vlinkId}</code></div>
@@ -442,6 +466,17 @@ export default function App() {
         </article>
       </section>
 
+      <section className="card walletCard">
+        <div className="eyebrow">2 · WALLET</div>
+        <h2><Wallet size={18}/> Your Veklom Wallet</h2>
+        <p>Carries funding and execution authority for governed actions. You can keep connecting and testing without funding it; funding is required before paid or externally settled actions.</p>
+        {workspaceState !== "ready" ? <p className="muted">Your workspace wallet appears here after sign-in.</p>
+          : !walletLookup ? <p className="muted">Checking your workspace wallet…</p>
+          : walletLookup.status === "bound" ? <div className="truthBadge"><CheckCircle2 size={16}/> Reusing <code>{shortWalletAddress(walletLookup.wallet.address)}</code> on {walletLookup.wallet.networkName}{walletLookup.wallet.testnet ? " (testnet)" : ""}. Nothing to set up for this connection.</div>
+          : walletLookup.status === "none" ? <p className="muted">No wallet on this workspace yet. <a className="manifest" href={`${accountOrigin}/os/onboarding?step=wallet`}>Create or connect one in Capability OS →</a> It is set up once and reused by every connection.</p>
+          : <p className="muted">Wallet status unavailable ({walletLookup.reason}). Connecting is not blocked.</p>}
+      </section>
+
       {pairing && !credential && <section className="card pairing">
         <div>
           <div className="eyebrow">PAIRING</div>
@@ -454,7 +489,7 @@ export default function App() {
       </section>}
 
       <section className="card">
-        <div className="eyebrow">3 · VERIFY</div>
+        <div className="eyebrow">5 · RECEIPT</div>
         <h2>Authenticated VLink activity</h2>
         {!credential ? <p className="muted">Pair the VLink first. A VLink identifier by itself cannot create activity through protected routes.</p> : activity.length === 0 ? <p className="muted">Run the authenticated connection test to create the first VLink-bound activity event.</p> : activity.map((event) => <div className="event" key={event.eventId}>
           <CheckCircle2 size={18}/><div><strong>Authenticated connection event</strong><span>{event.route} · {event.mode} · {event.status} · {event.latencyMs} ms</span><small>{event.timestamp}</small></div>
