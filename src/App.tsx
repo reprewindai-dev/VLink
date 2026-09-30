@@ -413,7 +413,7 @@ export default function App() {
             /></label>
             <label>Environment<select value={environment} onChange={(e) => setEnvironment(e.target.value)}><option>development</option><option>staging</option><option>production</option></select></label>
           </div>
-          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" href="/login?returnTo=%2Fvlink%2Fconnect%2F">Sign in →</a></div>}
+          {workspaceState === "signed-out" && <div className="error">Sign in before creating a VLink. <a className="manifest" href="/login?returnTo=%2Fvlink%2Fconnect%2F">Sign in →</a> New here? <a className="manifest" href="/signup?returnTo=%2Fvlink%2Fconnect%2F">Start your free trial →</a></div>}
           {workspaceState === "missing" && <div className="error">Finish Capability OS onboarding to bind a workspace before creating a VLink. <a className="manifest" href="/os/onboarding">Continue onboarding →</a></div>}
           {workspaceState === "failed" && <div className="error">VLink could not verify your workspace. Refresh after the identity service is available.</div>}
           <label>What are you linking?<select value={sourceType} onChange={(e) => setSourceType(e.target.value as VLinkSourceType)}>{sourceOptions.map((o) => <option value={o.value} key={o.value}>{o.label}</option>)}</select></label>
