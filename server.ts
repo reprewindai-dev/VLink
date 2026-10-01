@@ -29,6 +29,9 @@ if (process.env.NODE_ENV !== "production") {
 } else {
   const clientPath = path.join(process.cwd(), "dist", "client");
   app.use(express.static(clientPath));
+  // The client is built with base "/vlink/connect/" (veklom.com proxies that prefix here, stripped).
+  // Served directly on vlink.veklom.com the prefix arrives intact, so serve assets under it too.
+  app.use("/vlink/connect", express.static(clientPath));
   app.get("*", (_req, res) => res.sendFile(path.join(clientPath, "index.html")));
 }
 
