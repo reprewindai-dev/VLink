@@ -493,6 +493,42 @@ test("only the active operator/workspace that made a denial can repeat it", asyn
   }
 });
 
+test("an authorized device authorization can only be addressed by the workspace that approved it", async () => {
+  const isolated = createApp({
+    deviceAuthorizationEncryptionKey: "test-only-device-flow-encryption-key-32-bytes-minimum",
+    workspaceAuthenticator: async (token) => token === "human-owner"
+      ? { userId: "operator-1", workspaceId: "workspace-1" }
+      : token === "human-other" ? { userId: "operator-2", workspaceId: "workspace-2" } : undefined,
+  });
+  const server = isolated.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const startedResponse = await fetch(`${base}/api/v1/device/authorizations`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ machineIdentity: "machine-deny-2", displayName: "Approved Agent", sourceType: "container" }),
+    });
+    const started = await startedResponse.json() as { userCode: string; deviceCode: string };
+    const act = (verb: "approve" | "deny", token: string) => fetch(`${base}/api/v1/device/authorizations/${started.userCode}/${verb}`, {
+      method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: "{}",
+    });
+    assert.equal((await act("approve", "human-owner")).status, 200);
+
+    // A different workspace learns nothing: not that it exists, nor that it is already authorized.
+    const foreignDeny = await act("deny", "human-other");
+    assert.equal(foreignDeny.status, 404);
+    assert.equal(((await foreignDeny.json()) as { error: string }).error, "authorization_not_found");
+    assert.equal(isolated.registry.getDeviceAuthorization(started.userCode)?.status, "authorized");
+
+    // The approving workspace still gets the honest conflict.
+    const ownerDeny = await act("deny", "human-owner");
+    assert.equal(ownerDeny.status, 409);
+    assert.equal(((await ownerDeny.json()) as { error: string }).error, "already_authorized");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  }
+});
+
 
 test("manifest is self-binding and contains no enrollment, pairing, or access secrets", async () => {
   const created = await createVLink();

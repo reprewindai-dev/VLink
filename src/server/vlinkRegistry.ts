@@ -471,9 +471,10 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
     const record = this.findDeviceAuthorization("userCodeHash", userCode);
     if (!record) return undefined;
     this.expireDeviceAuthorizationIfNeeded(record, now);
-    if (record.status === "denied") {
-      if (record.workspaceId !== workspaceId || record.operatorId !== operatorId) return undefined;
-      return this.publicDeviceAuthorization(record);
+    // Once a workspace has settled the authorization (approved or denied) only that
+    // workspace's operator may address it again; anyone else sees "not found", as on approve.
+    if (record.workspaceId !== undefined && (record.workspaceId !== workspaceId || record.operatorId !== operatorId)) {
+      return undefined;
     }
     if (record.status === "pending") {
       record.status = "denied";
