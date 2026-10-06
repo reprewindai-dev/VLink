@@ -721,6 +721,46 @@ test("production anonymous bootstrap requires a canonical HTTPS origin and stabl
   }
 });
 
+test("device-flow verification URIs follow VLINK_PAIRING_ORIGIN and fall back to the hosted connect page", async () => {
+  const verificationUris = async (appOptions: Parameters<typeof createApp>[0]) => {
+    const isolated = createApp({ deviceAuthorizationEncryptionKey: "test-only-device-flow-encryption-key-32-bytes-minimum", ...appOptions });
+    const server = isolated.app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const isolatedBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const discovery = (await (await fetch(`${isolatedBase}/.well-known/vlink.json`)).json()) as { authorization: { verificationUri: string } };
+      const started = await fetch(`${isolatedBase}/api/v1/device/authorizations`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ machineIdentity: "machine-origin-1", displayName: "Origin Agent", sourceType: "container" }),
+      });
+      assert.equal(started.status, 201);
+      const { verificationUri, userCode } = (await started.json()) as { verificationUri: string; userCode: string };
+      return { discovery: discovery.authorization.verificationUri, device: verificationUri, userCode };
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+    }
+  };
+
+  const previous = process.env.VLINK_PAIRING_ORIGIN;
+  delete process.env.VLINK_PAIRING_ORIGIN;
+  try {
+    const fallback = await verificationUris({});
+    assert.equal(fallback.discovery, "https://veklom.com/vlink/connect/authorize?user_code={userCode}");
+    assert.equal(fallback.device, `https://veklom.com/vlink/connect/authorize?user_code=${encodeURIComponent(fallback.userCode)}`);
+
+    process.env.VLINK_PAIRING_ORIGIN = "https://pair.staging.example.test/";
+    const fromEnv = await verificationUris({});
+    assert.equal(fromEnv.discovery, "https://pair.staging.example.test/authorize?user_code={userCode}");
+    assert.ok(fromEnv.device.startsWith("https://pair.staging.example.test/authorize?user_code="));
+
+    const fromOption = await verificationUris({ pairingOrigin: "https://pair.option.example.test" });
+    assert.equal(fromOption.discovery, "https://pair.option.example.test/authorize?user_code={userCode}", "the explicit option wins over the environment");
+  } finally {
+    if (previous === undefined) delete process.env.VLINK_PAIRING_ORIGIN;
+    else process.env.VLINK_PAIRING_ORIGIN = previous;
+  }
+});
+
 
 test("LockerPhycer owner and MFA endpoints, not auth/me claims, authorize unbound bootstrap", async () => {
   const seen = { ownerPath: "", mfaCalls: 0 };

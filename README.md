@@ -164,7 +164,9 @@ holder credentials only to the configured cAPI Interlink boundary.
 | Variable | Purpose |
 | --- | --- |
 | `PORT` | HTTP port. Default `3000`. |
-| `VLINK_PUBLIC_ORIGIN` | Canonical public origin used in generated manifests/endpoints. |
+| `VLINK_PUBLIC_ORIGIN` | Canonical public origin used in generated manifests/endpoints. Also read at client build time (`npm run build` / Docker `--build-arg`) to pin the API origin the pairing page calls; unset, the page calls `https://vlink.veklom.com` from veklom.com and same-origin elsewhere. |
+| `VLINK_PAIRING_ORIGIN` | Origin of the human pairing/verification page used in pairing URLs and device-flow `verificationUri`. Default `https://veklom.com/vlink/connect`. |
+| `VLINK_ACCOUNT_ORIGIN` | Client build-time only. Origin of the account frontend for sign-in, signup and onboarding links; unset, `https://veklom.com` is used from vlink.veklom.com and relative links elsewhere. |
 | `VLINK_CORS_ORIGIN` | Allowed browser origin. Default `*` for local/prototype use; set explicitly in production. |
 | `VLINK_STATE_PATH` | Required in production. Persistent single-node registry state for VLink identity, hashed access/pairing state, revocation, bootstrap admission windows, bounded request-proof replay records, and activity metadata. |
 | `VLINK_LOCKERPHYCER_URL` | Required in production (or use `LOCKERPHYCER_URL`). LockerPhycer identity API used to validate workspace-bound sessions and recent MFA for pairing approval. |

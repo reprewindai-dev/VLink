@@ -10,6 +10,7 @@ import {
   type WorkspaceWalletLookup,
 } from "./account-session";
 import { noteSignedIn, track } from "./analytics/tracker";
+import { resolveAccountOrigin, resolveApiOrigin } from "./client/origins";
 import type {
   VLinkAccessCredential,
   VLinkActivityEvent,
@@ -31,13 +32,13 @@ const sourceOptions: Array<{ value: VLinkSourceType; label: string }> = [
   { value: "container", label: "Docker / Kubernetes workload" },
 ];
 
-const apiOrigin = ["veklom.com", "www.veklom.com"].includes(window.location.hostname)
-  ? "https://vlink.veklom.com"
-  : "";
+// Both origins can be pinned at build time (VLINK_PUBLIC_ORIGIN / VLINK_ACCOUNT_ORIGIN, see
+// vite.config.ts); otherwise the veklom.com hostname-based defaults apply.
+const apiOrigin = resolveApiOrigin(window.location.hostname, import.meta.env.VLINK_PUBLIC_ORIGIN);
 
 // Sign-in and signup live on the veklom.com frontend; on vlink.veklom.com a relative
 // link would land in this app's own catch-all instead.
-const accountOrigin = window.location.hostname === "vlink.veklom.com" ? "https://veklom.com" : "";
+const accountOrigin = resolveAccountOrigin(window.location.hostname, import.meta.env.VLINK_ACCOUNT_ORIGIN);
 
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const headers = new Headers(init?.headers);

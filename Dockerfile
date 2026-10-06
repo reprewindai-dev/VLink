@@ -7,6 +7,9 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# Build-time client origins (optional; defaults to the veklom.com hostname rules in src/client/origins.ts).
+ARG VLINK_PUBLIC_ORIGIN
+ARG VLINK_ACCOUNT_ORIGIN
 RUN npm run build
 
 FROM node:20-alpine AS runner

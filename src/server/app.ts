@@ -61,6 +61,8 @@ const SOURCE_TYPES = new Set<VLinkSourceType>([
   "container",
 ]);
 
+export const DEFAULT_PAIRING_ORIGIN = "https://veklom.com/vlink/connect";
+
 const originFor = (req: Request, configured?: string) => {
   if (configured) return configured.replace(/\/$/, "");
   return `${req.protocol}://${req.get("host")}`;
@@ -144,6 +146,9 @@ export function createApp(options: CreateAppOptions = {}) {
   const enableAnonymousBootstrap = options.enableAnonymousBootstrap ??
     (process.env.NODE_ENV !== "production" || process.env.VLINK_ANONYMOUS_BOOTSTRAP_ENABLED === "true");
   const bootstrapPublicOrigin = options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || options.publicOrigin || process.env.VLINK_PUBLIC_ORIGIN;
+  // Where a human completes device-flow verification: the pairing page's origin
+  // (VLINK_PAIRING_ORIGIN), defaulting to the hosted veklom.com connect page.
+  const pairingVerificationOrigin = (options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || DEFAULT_PAIRING_ORIGIN).replace(/\/+$/, "");
   if (process.env.NODE_ENV === "production" && enableAnonymousBootstrap) {
     if (!bootstrapPublicOrigin?.trim()) {
       throw new Error("VLINK_PAIRING_ORIGIN or VLINK_PUBLIC_ORIGIN must be configured before anonymous bootstrap can be enabled in production");
@@ -521,7 +526,7 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.json(safeManifestJson(manifest));
     }
     const publicOrigin = originFor(req, options.publicOrigin);
-    const verificationOrigin = (options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || "https://veklom.com/vlink/connect").replace(/\/$/, "");
+    const verificationOrigin = pairingVerificationOrigin;
     res.json({
       version: "1.0",
       protocol: "vlink/v1",
@@ -649,11 +654,10 @@ export function createApp(options: CreateAppOptions = {}) {
         required: { machineIdentity: "1-128 chars: letters, digits, dot, underscore, colon, hyphen", displayName: "1-100 chars", sourceType: Array.from(SOURCE_TYPES) },
       });
     }
-    const verificationOrigin = (options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || "https://veklom.com/vlink/connect").replace(/\/$/, "");
     try {
       const request = registry.startDeviceAuthorization(
         { machineIdentity, displayName, sourceType: sourceType as VLinkSourceType },
-        `${verificationOrigin}/authorize?user_code={userCode}`,
+        `${pairingVerificationOrigin}/authorize?user_code={userCode}`,
         deviceAuthorizationTtlSeconds,
         5,
       );
