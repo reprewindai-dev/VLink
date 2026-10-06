@@ -14,7 +14,8 @@ test("runtime image owns /app/data before dropping to the vlink user", () => {
   assert.ok(groupMatch, "runner stage must create a system group for the runtime user");
 
   const stateDir = lineIndex(new RegExp(`^RUN mkdir -p /app/data && chown ${runtimeUser}:${groupMatch![1]} /app/data$`));
-  const dropPrivileges = lineIndex(new RegExp(`^USER\s+${runtimeUser}$`));
+  const dropPrivileges = dockerfile.findIndex((line) => line.trim() === `USER ${runtimeUser}`);
   assert.notEqual(stateDir, -1, "Dockerfile must create /app/data owned by the runtime user");
+  assert.notEqual(dropPrivileges, -1, "Dockerfile must drop privileges to the runtime user");
   assert.ok(stateDir < dropPrivileges, "/app/data must be prepared while still root, before USER");
 });
