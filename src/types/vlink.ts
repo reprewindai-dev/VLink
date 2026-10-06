@@ -39,6 +39,12 @@ export interface VLinkRecord {
   governance?: VLinkGovernanceRefs;
   connectionStatus: VLinkConnectionStatus;
   enrollmentStatus: VLinkEnrollmentStatus;
+  machineIdentity?: {
+    value: string;
+    assurance: "client-asserted";
+    boundAt: string;
+    operatorId?: string;
+  };
   createdAt: string;
   updatedAt: string;
   expiresAt?: string;

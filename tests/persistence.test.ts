@@ -31,6 +31,7 @@ const createLink = (registry: FileBackedVLinkRegistry) =>
 test("VLink identity, pairing, access, activity, and revocation survive process-style registry recreation", () => {
   withStatePath((statePath) => {
     const first = new FileBackedVLinkRegistry({ statePath });
+    assert.equal(first.persistenceMode, "file");
     const vlink = createLink(first);
     const enrollment = first.issueEnrollmentGrant(vlink.vlinkId, 900, new Date("2026-08-30T20:00:00Z"));
     assert.ok(enrollment);
@@ -270,5 +271,41 @@ test("clear is durable and does not resurrect deleted runtime state", () => {
     assert.equal(registry.list().length, 1);
     registry.clear();
     assert.equal(new FileBackedVLinkRegistry({ statePath }).list().length, 0);
+  });
+});
+
+test("device authorization survives restart with only hashes and encrypted credential material on disk", () => {
+  withStatePath((statePath) => {
+    const key = "test-only-device-flow-encryption-key-32-bytes-minimum";
+    const first = new FileBackedVLinkRegistry({ statePath });
+    first.configureDeviceAuthorizationEncryptionKey(key);
+    const started = first.startDeviceAuthorization({
+      machineIdentity: "machine-test-01",
+      displayName: "Test Agent",
+      sourceType: "agent-mcp",
+    }, "https://veklom.example.test/authorize?user_code={userCode}", 900, 5, new Date("2026-09-23T12:00:00Z"));
+
+    assert.equal(first.pollDeviceAuthorization(started.deviceCode, new Date("2026-09-23T12:00:00Z"))?.status, "authorization_pending");
+    const approved = first.approveDeviceAuthorization(started.userCode, "workspace-test", "operator-test", "https://vlink.example.test", 3600, new Date("2026-09-23T12:00:06Z"));
+    assert.equal(approved?.status, "authorized");
+    const raw = readFileSync(statePath, "utf8");
+    for (const secret of [started.deviceCode, started.userCode]) assert.equal(raw.includes(secret), false);
+    assert.match(raw, /credentialCiphertext/);
+
+    const second = new FileBackedVLinkRegistry({ statePath });
+    second.configureDeviceAuthorizationEncryptionKey(key);
+    const authorized = second.pollDeviceAuthorization(started.deviceCode, new Date("2026-09-23T12:00:07Z"));
+    assert.equal(authorized?.status, "authorized");
+    if (authorized?.status !== "authorized") throw new Error("Expected authorized device poll result");
+    assert.equal(authorized.vlink.workspaceId, "workspace-test");
+    assert.equal(authorized.vlink.machineIdentity?.value, "machine-test-01");
+    assert.ok(second.authenticate(authorized.vlink.vlinkId, authorized.credential.token, new Date("2026-09-23T12:00:08Z")));
+
+    second.revokeCredential(authorized.vlink.vlinkId, authorized.credential.credentialId, new Date("2026-09-23T12:00:09Z"));
+    assert.deepEqual(second.pollDeviceAuthorization(started.deviceCode, new Date("2026-09-23T12:00:10Z")), {
+      status: "access_denied",
+      error: "credential_revoked",
+      expiresAt: started.expiresAt,
+    });
   });
 });

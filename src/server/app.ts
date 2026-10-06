@@ -10,6 +10,7 @@ import { createLeaseSealer } from "./leaseSealer";
 import type { LeaseSealer } from "./leaseSealer";
 import { authenticateVLinkRequest, captureVLinkRequestBodyHash } from "./requestProof";
 import * as cappoRelay from "./cappoRelay";
+import { installAnalyticsProxy } from "./analyticsProxy";
 import type { VLinkAccessCredentialSummary, VLinkDeviceBootstrapView, VLinkSourceType } from "../types/vlink";
 
 export interface VLinkWorkspaceIdentity {
@@ -40,6 +41,8 @@ export interface CreateAppOptions {
   enableAnonymousBootstrap?: boolean;
   enrollmentGrantTtlSeconds?: number;
   accessTokenTtlSeconds?: number;
+  deviceAuthorizationEncryptionKey?: string;
+  deviceAuthorizationTtlSeconds?: number;
   lockerPhycerBaseUrl?: string;
   workspaceAuthenticator?: VLinkWorkspaceAuthenticator;
   leaseSealer?: LeaseSealer | null;
@@ -184,6 +187,29 @@ export function createApp(options: CreateAppOptions = {}) {
     3600,
     86400,
   );
+  const deviceAuthorizationEncryptionKey = options.deviceAuthorizationEncryptionKey ?? process.env.VLINK_DEVICE_FLOW_ENCRYPTION_KEY ?? "";
+  const deviceAuthorizationTtlSeconds = clampSeconds(
+    options.deviceAuthorizationTtlSeconds ?? Number(process.env.VLINK_DEVICE_AUTHORIZATION_TTL_SECONDS ?? 900),
+    900,
+    1800,
+  );
+  registry.configureDeviceAuthorizationEncryptionKey(deviceAuthorizationEncryptionKey || null);
+  const deviceFlowRate = new Map<string, { windowStartedAt: number; count: number }>();
+  const allowDeviceFlowRequest = (req: Request, res: Response) => {
+    const key = req.header("cf-connecting-ip")?.trim() || req.ip || req.socket.remoteAddress || "unknown";
+    const now = Date.now();
+    const current = deviceFlowRate.get(key);
+    const bucket = !current || now - current.windowStartedAt >= 60_000 ? { windowStartedAt: now, count: 0 } : current;
+    bucket.count += 1;
+    deviceFlowRate.set(key, bucket);
+    if (deviceFlowRate.size > 10_000) {
+      for (const [ip, entry] of deviceFlowRate) if (now - entry.windowStartedAt >= 60_000) deviceFlowRate.delete(ip);
+    }
+    if (bucket.count <= 30) return true;
+    res.setHeader("Retry-After", "60");
+    res.status(429).json({ error: "rate_limited", retryAfter: 60 });
+    return false;
+  };
 
   const lockerPhycerBaseUrl = (
     options.lockerPhycerBaseUrl ??
@@ -378,7 +404,7 @@ export function createApp(options: CreateAppOptions = {}) {
       unauthenticatedCreateEnabled: allowUnauthenticatedCreate,
       anonymousBootstrapEnabled: enableAnonymousBootstrap,
       workspaceAuthConfigured: Boolean(workspaceAuthenticator),
-      persistence: "memory",
+      persistence: registry.persistenceMode,
       leaseSealing: Boolean(leaseSealer),
       capiConfigured: Boolean(process.env.VLINK_CAPI_BASE_URL?.trim()),
       timestamp: new Date().toISOString(),
@@ -390,7 +416,9 @@ export function createApp(options: CreateAppOptions = {}) {
 
     if (!allowUnauthenticatedCreate) {
       const token = getBearerToken(req);
-      if (!token) {
+      // VLink-issued enrollment grants (vle_) and access tokens (vlt_) are never workspace
+      // sessions; reject them locally instead of forwarding them to LockerPhycer.
+      if (!token || token.startsWith("vle_") || token.startsWith("vlt_")) {
         res.setHeader("WWW-Authenticate", 'Bearer realm="Veklom workspace"');
         return res.status(401).json({
           error: "workspace_auth_required",
@@ -480,12 +508,14 @@ export function createApp(options: CreateAppOptions = {}) {
       if (!manifest) return res.status(404).json({ error: "vlink_not_found" });
       return res.json(safeManifestJson(manifest));
     }
+    const publicOrigin = originFor(req, options.publicOrigin);
+    const verificationOrigin = (options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || "https://veklom.com/vlink/connect").replace(/\/$/, "");
     res.json({
       version: "1.0",
       protocol: "vlink/v1",
       service: "VLink",
-      createVLink: `${originFor(req, options.publicOrigin)}/api/v1/vlinks`,
-      discovery: `${originFor(req, options.publicOrigin)}/.well-known/vlink.json?vlinkId=<vlk_...>`,
+      createVLink: `${publicOrigin}/api/v1/vlinks`,
+      discovery: `${publicOrigin}/.well-known/vlink.json?vlinkId=<vlk_...>`,
       managementAuth: {
         scheme: "bearer",
         authority: "LockerPhycer",
@@ -493,8 +523,214 @@ export function createApp(options: CreateAppOptions = {}) {
         workspaceBootstrap: "https://veklom.com/os/onboarding",
         authenticatedConnect: "https://veklom.com/vlink/connect/",
       },
-      note: "Discovery is secret-free. Production VLink creation requires a LockerPhycer workspace-bound session; VLink connection identity is not consequence authority.",
+      authorization: {
+        type: "device_flow",
+        enabled: Boolean(deviceAuthorizationEncryptionKey),
+        startMethod: "POST",
+        startEndpoint: `${publicOrigin}/api/v1/device/authorizations`,
+        startRequest: { machineIdentity: "client-asserted string", displayName: "1-100 chars", sourceType: Array.from(SOURCE_TYPES) },
+        startResponse: ["deviceCode", "userCode", "verificationUri", "expiresAt", "expiresIn", "interval", "scope"],
+        tokenMethod: "POST",
+        tokenEndpoint: `${publicOrigin}/api/v1/device/authorizations/token`,
+        tokenRequest: { deviceCode: "deviceCode returned by startEndpoint" },
+        verificationUri: `${verificationOrigin}/authorize?user_code={userCode}`,
+        statusMethod: "GET",
+        statusEndpoint: `${publicOrigin}/api/v1/device/authorizations/{userCode}`,
+        approvalMethod: "POST",
+        approvalEndpoint: `${publicOrigin}/api/v1/device/authorizations/{userCode}/approve`,
+        denialEndpoint: `${publicOrigin}/api/v1/device/authorizations/{userCode}/deny`,
+        approvalRequires: "active LockerPhycer identity with authenticated workspace ownership",
+        humanApproves: ["client-asserted machine identity", "display name", "VLink API connection scope"],
+        scope: "vlink:connect",
+        audience: "VLink",
+        expiresInSeconds: deviceAuthorizationTtlSeconds,
+        pollIntervalSeconds: 5,
+        pollStates: ["authorization_pending", "slow_down", "access_denied", "expired_token", "authorized"],
+        retrySemantics: {
+          polling: "safe; authorized polling returns the same encrypted-at-rest credential until expiry or revocation",
+          duplicateApproval: "idempotent for the same operator and workspace; no duplicate VLink is created",
+          duplicateStart: "same active machine identity returns HTTP 409",
+          rateLimit: "30 requests per client IP per minute; pending requests capped at 500",
+        },
+        errorResponses: [
+          { httpStatus: 400, error: "invalid_device_code" },
+          { httpStatus: 400, error: "access_denied" },
+          { httpStatus: 400, error: "expired_token" },
+          { httpStatus: 401, error: "workspace_session_required" },
+          { httpStatus: 403, error: "workspace_required" },
+          { httpStatus: 404, error: "authorization_not_found" },
+          { httpStatus: 409, error: "device_authorization_already_pending" },
+          { httpStatus: 409, error: "device_authorization_already_active" },
+          { httpStatus: 429, error: "slow_down" },
+          { httpStatus: 503, error: "device_authorization_unavailable" },
+        ],
+        credential: {
+          type: "opaque-temporary-bearer",
+          binding: "one operator + workspace + VLink + client-asserted machine identity",
+          capabilityScope: "VLink API connection only; CAPPO authority is separate",
+          machineIdentityAssurance: "client-asserted; not hardware attestation",
+          revokeEndpoint: `${publicOrigin}/api/v1/vlinks/{vlinkId}/access/revoke`,
+        },
+      },
+      vlink: {
+        pairEndpoint: `${publicOrigin}/api/v1/vlinks/{vlinkId}/pairing`,
+        statusEndpoint: `${publicOrigin}/api/v1/vlinks/{vlinkId}`,
+        manifestEndpoint: `${publicOrigin}/api/v1/vlinks/{vlinkId}/manifest`,
+        revokeEndpoint: `${publicOrigin}/api/v1/vlinks/{vlinkId}/access/revoke`,
+      },
+      note: "Discovery is secret-free. Production VLink creation requires a LockerPhycer workspace-bound session. Reachability, authenticated identity, VLink binding, CAPPO authority, execution, and evidence are separate states; VLink connection identity and device-flow credentials do not grant CAPPO authority.",
     });
+  });
+
+  const normalizeUserCode = (value: unknown) => String(value ?? "").toUpperCase().replace(/[\s-]/g, "");
+  const requireDeviceFlow = (req: Request, res: Response) => allowDeviceFlowRequest(req, res);
+  const requireWorkspaceIdentity = async (req: Request, res: Response) => {
+    const token = getBearerToken(req);
+    if (!token || token.startsWith("vle_") || token.startsWith("vlt_")) {
+      res.setHeader("WWW-Authenticate", 'Bearer realm="VLink device authorization"');
+      res.status(401).json({ error: "workspace_session_required" });
+      return undefined;
+    }
+    if (!workspaceAuthenticator) {
+      res.status(503).json({ error: "workspace_authority_unconfigured" });
+      return undefined;
+    }
+    try {
+      const identity = await workspaceAuthenticator(token);
+      if (!identity) {
+        res.status(401).json({ error: "invalid_workspace_session" });
+        return undefined;
+      }
+      if (!identity.workspaceId.trim()) {
+        res.status(403).json({ error: "workspace_required" });
+        return undefined;
+      }
+      const operatorId = identity.userId?.trim();
+      if (!operatorId) {
+        res.status(403).json({ error: "verified_operator_identity_required" });
+        return undefined;
+      }
+      return { ...identity, userId: operatorId };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("not bound to a workspace")) {
+        res.status(403).json({ error: "workspace_required" });
+      } else if (error instanceof Error && error.message.includes("workspace authorization denied")) {
+        res.status(403).json({ error: "workspace_access_denied" });
+      } else {
+        res.status(503).json({ error: "workspace_authority_unavailable" });
+      }
+      return undefined;
+    }
+  };
+
+  app.post("/api/v1/device/authorizations", (req, res) => {
+    if (!requireDeviceFlow(req, res)) return;
+    if (!deviceAuthorizationEncryptionKey) {
+      return res.status(503).json({ error: "device_authorization_unavailable", reason: "server_encryption_key_unconfigured" });
+    }
+    const machineIdentity = String(req.body?.machineIdentity ?? "").trim();
+    const displayName = String(req.body?.displayName ?? "").trim();
+    const sourceType = String(req.body?.sourceType ?? "");
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(machineIdentity) || displayName.length < 1 || displayName.length > 100 || !SOURCE_TYPES.has(sourceType as VLinkSourceType)) {
+      return res.status(400).json({
+        error: "invalid_device_authorization_request",
+        required: { machineIdentity: "1-128 chars: letters, digits, dot, underscore, colon, hyphen", displayName: "1-100 chars", sourceType: Array.from(SOURCE_TYPES) },
+      });
+    }
+    const verificationOrigin = (options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN || "https://veklom.com/vlink/connect").replace(/\/$/, "");
+    try {
+      const request = registry.startDeviceAuthorization(
+        { machineIdentity, displayName, sourceType: sourceType as VLinkSourceType },
+        `${verificationOrigin}/authorize?user_code={userCode}`,
+        deviceAuthorizationTtlSeconds,
+        5,
+      );
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(201).json({
+        deviceCode: request.deviceCode,
+        userCode: request.userCode,
+        verificationUri: request.verificationUri,
+        expiresAt: request.expiresAt,
+        expiresIn: Math.floor((Date.parse(request.expiresAt) - Date.now()) / 1000),
+        interval: request.interval,
+        scope: "vlink:connect",
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "device_authorization_capacity_reached") return res.status(503).json({ error: error.message, retryable: true });
+      if (error instanceof Error && (error.message === "device_authorization_already_pending" || error.message === "device_authorization_already_active")) return res.status(409).json({ error: error.message, retryable: false });
+      throw error;
+    }
+  });
+
+  app.get("/api/v1/device/authorizations/:userCode", (req, res) => {
+    if (!requireDeviceFlow(req, res)) return;
+    const authorization = registry.getDeviceAuthorization(normalizeUserCode(req.params.userCode));
+    if (!authorization) return res.status(404).json({ error: "authorization_not_found" });
+    res.setHeader("Cache-Control", "no-store");
+    const { workspaceId: _workspaceId, operatorId: _operatorId, vlinkId: _vlinkId, ...publicAuthorization } = authorization;
+    return res.json({ authorization: publicAuthorization });
+  });
+
+  app.post("/api/v1/device/authorizations/:userCode/approve", async (req, res) => {
+    if (!requireDeviceFlow(req, res)) return;
+    const identity = await requireWorkspaceIdentity(req, res);
+    if (!identity) return;
+    try {
+      const authorization = registry.approveDeviceAuthorization(
+        normalizeUserCode(req.params.userCode), identity.workspaceId, identity.userId,
+        originFor(req, options.publicOrigin), accessTokenTtlSeconds,
+      );
+      if (!authorization) return res.status(404).json({ error: "authorization_not_found_or_owned_by_another_operator" });
+      if (authorization.status === "expired") return res.status(410).json({ error: "expired_token" });
+      if (authorization.status === "denied") return res.status(409).json({ error: "access_denied" });
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(authorization.status === "authorized" ? 200 : 409).json({
+        error: authorization.status === "authorized" ? undefined : "authorization_not_pending",
+        authorization,
+        vlink: authorization.vlinkId ? registry.get(authorization.vlinkId) : undefined,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "device_authorization_encryption_unconfigured") {
+        return res.status(503).json({ error: "device_authorization_unavailable", reason: "server_encryption_key_unconfigured" });
+      }
+      throw error;
+    }
+  });
+
+  app.post("/api/v1/device/authorizations/:userCode/deny", async (req, res) => {
+    if (!requireDeviceFlow(req, res)) return;
+    const identity = await requireWorkspaceIdentity(req, res);
+    if (!identity) return;
+    const authorization = registry.denyDeviceAuthorization(
+      normalizeUserCode(req.params.userCode), identity.workspaceId, identity.userId,
+    );
+    if (!authorization) return res.status(404).json({ error: "authorization_not_found" });
+    if (authorization.status === "authorized") return res.status(409).json({ error: "already_authorized" });
+    if (authorization.status === "expired") return res.status(410).json({ error: "expired_token" });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ authorization });
+  });
+
+  app.post("/api/v1/device/authorizations/token", (req, res) => {
+    if (!requireDeviceFlow(req, res)) return;
+    if (!deviceAuthorizationEncryptionKey) {
+      return res.status(503).json({ error: "device_authorization_unavailable", reason: "server_encryption_key_unconfigured" });
+    }
+    try {
+      const result = registry.pollDeviceAuthorization(String(req.body?.deviceCode ?? ""));
+      if (!result) return res.status(400).json({ error: "invalid_device_code" });
+      res.setHeader("Cache-Control", "no-store");
+      if (result.status === "authorization_pending") return res.status(400).json(result);
+      if (result.status === "slow_down") return res.status(429).json(result);
+      if (result.status === "access_denied") return res.status(400).json(result);
+      if (result.status === "expired_token") return res.status(400).json(result);
+      return res.json({ ...result, tokenType: "Bearer", audience: "VLink", scope: "vlink:connect" });
+    } catch (error) {
+      if (error instanceof Error && error.message === "device_authorization_encryption_unconfigured") {
+        return res.status(503).json({ error: "device_authorization_unavailable", reason: "server_encryption_key_unconfigured" });
+      }
+      throw error;
+    }
   });
 
   app.post("/api/v1/vlinks/:vlinkId/pairing", (req, res) => {
@@ -1268,6 +1504,8 @@ export function createApp(options: CreateAppOptions = {}) {
       message: "VLink publishes an MCP endpoint placeholder; full MCP transport is not implemented in this release.",
     });
   });
+
+  installAnalyticsProxy(app, { lockerPhycerBaseUrl: lockerPhycerBaseUrl || undefined });
 
   app.use(["/api", "/v1", "/mcp", "/vlinks"], (_req, res) => res.status(404).json({ error: "not_found" }));
 

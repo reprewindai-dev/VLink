@@ -173,6 +173,8 @@ holder credentials only to the configured cAPI Interlink boundary.
 | `VLINK_BOOTSTRAP_GLOBAL_LIMIT` / `VLINK_BOOTSTRAP_GLOBAL_WINDOW_SECONDS` | Anonymous bootstrap create limit across the VLink instance. Defaults to 100 requests per 3600 seconds. |
 | `VLINK_ENROLLMENT_TTL_SECONDS` | Enrollment-grant lifetime. Default `900`, clamped to at most one hour. |
 | `VLINK_ACCESS_TOKEN_TTL_SECONDS` | Temporary workload-token lifetime. Default `3600`, clamped to at most one day. |
+| `VLINK_DEVICE_FLOW_ENCRYPTION_KEY` | Enables the machine device-authorization flow (`/api/v1/device/authorizations`). Stable server secret of at least 32 bytes used to encrypt device-flow credentials at rest; when unset the flow answers `503 device_authorization_unavailable`. Keep stable across restarts. |
+| `VLINK_DEVICE_AUTHORIZATION_TTL_SECONDS` | Device-authorization request lifetime. Default `900`, clamped to at most `1800`. |
 | `VLINK_ALLOW_UNBOUND_COMPAT` | Deliberately enable unbound global compatibility traffic. Defaults off. |
 | `VLINK_ALLOW_UNAUTHENTICATED_CREATE` | Explicit override allowing unauthenticated VLink creation in production. Defaults off in production. |
 | `VLINK_RECEIPT_PRIVATE_KEY_PEM` | Optional Ed25519 private key PEM for stable receipt signing. If absent, VLink uses an explicitly disclosed ephemeral process key. |
