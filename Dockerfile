@@ -16,6 +16,9 @@ RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 vlink
 COPY --from=builder --chown=vlink:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=vlink:nodejs /app/dist ./dist
 COPY --from=builder --chown=vlink:nodejs /app/node_modules ./node_modules
+# VLINK_STATE_PATH is expected under /app/data; FileBackedVLinkRegistry creates the file but the
+# directory must exist and belong to the runtime user (a fresh named volume inherits this ownership).
+RUN mkdir -p /app/data && chown vlink:nodejs /app/data
 USER vlink
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
