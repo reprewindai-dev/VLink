@@ -49,7 +49,43 @@ export interface CreateAppOptions {
   bootstrapRateLimitKey?: string;
   trustedProxyCidrs?: string[];
   bootstrapAdmissionPolicy?: Partial<BootstrapAdmissionPolicy>;
+  /** Explicit browser origins allowed by CORS (`"*"` for any); overrides VLINK_CORS_ORIGIN. */
+  corsOrigins?: string[];
 }
+
+export interface CorsPolicy {
+  mode: "any" | "allowlist";
+  origins: string[];
+  source: "VLINK_CORS_ORIGIN" | "configured public origins" | "default";
+}
+
+const originOf = (value: string | undefined): string | undefined => {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Browser origins VLink answers CORS for: an explicit VLINK_CORS_ORIGIN list wins; otherwise
+ * the configured public origins (frontend/pairing page + VLink API) form the allowlist; only
+ * when nothing is configured does VLink fall back to `*`.
+ */
+export const resolveCorsPolicy = (input: {
+  configured?: string[];
+  publicOrigin?: string;
+  pairingOrigin?: string;
+}): CorsPolicy => {
+  const configured = (input.configured ?? []).map((origin) => origin.trim()).filter(Boolean);
+  if (configured.includes("*")) return { mode: "any", origins: ["*"], source: "VLINK_CORS_ORIGIN" };
+  if (configured.length) return { mode: "allowlist", origins: Array.from(new Set(configured)), source: "VLINK_CORS_ORIGIN" };
+  const derived = Array.from(new Set([originOf(input.pairingOrigin), originOf(input.publicOrigin)].filter((origin): origin is string => Boolean(origin))));
+  if (derived.length) return { mode: "allowlist", origins: derived, source: "configured public origins" };
+  return { mode: "any", origins: ["*"], source: "default" };
+};
 
 const SOURCE_TYPES = new Set<VLinkSourceType>([
   "ai-client",
@@ -286,9 +322,19 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.disable("x-powered-by");
   if (trustedProxyCidrs.length) app.set("trust proxy", trustedProxyCidrs);
+  const corsPolicy = resolveCorsPolicy({
+    configured: options.corsOrigins ?? (process.env.VLINK_CORS_ORIGIN ?? "").split(","),
+    publicOrigin: options.publicOrigin || process.env.VLINK_PUBLIC_ORIGIN,
+    pairingOrigin: options.pairingOrigin || process.env.VLINK_PAIRING_ORIGIN,
+  });
   app.use((req: Request, res: Response, next: NextFunction) => {
-    const allowedOrigin = process.env.VLINK_CORS_ORIGIN || "*";
-    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    if (corsPolicy.mode === "any") {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    } else {
+      res.setHeader("Vary", "Origin");
+      const origin = req.header("origin")?.trim();
+      if (origin && corsPolicy.origins.includes(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-VLink-Id,X-Target-Url,X-VLink-Device-Proof");
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -1525,5 +1571,5 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.use(["/api", "/v1", "/mcp", "/vlinks"], (_req, res) => res.status(404).json({ error: "not_found" }));
 
-  return { app, registry };
+  return { app, registry, corsPolicy };
 }

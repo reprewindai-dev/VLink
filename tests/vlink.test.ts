@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
-import { createApp } from "../src/server/app";
+import { createApp, resolveCorsPolicy } from "../src/server/app";
 import { VLinkDeviceClient } from "../src/client/deviceClient";
 import { createLeaseSealer } from "../src/server/leaseSealer";
 import { deviceProofPayload, deviceRequestProofPayload } from "../src/server/pairingProof";
@@ -758,6 +758,48 @@ test("device-flow verification URIs follow VLINK_PAIRING_ORIGIN and fall back to
   } finally {
     if (previous === undefined) delete process.env.VLINK_PAIRING_ORIGIN;
     else process.env.VLINK_PAIRING_ORIGIN = previous;
+  }
+});
+
+test("CORS defaults to the configured public origins and only falls back to * when nothing is configured", async () => {
+  assert.deepEqual(resolveCorsPolicy({}), { mode: "any", origins: ["*"], source: "default" });
+  assert.deepEqual(
+    resolveCorsPolicy({ publicOrigin: "https://vlink.example.test/", pairingOrigin: "https://app.example.test/vlink/connect" }),
+    { mode: "allowlist", origins: ["https://app.example.test", "https://vlink.example.test"], source: "configured public origins" },
+  );
+  assert.deepEqual(
+    resolveCorsPolicy({ configured: [" https://a.example.test", "https://b.example.test", ""], publicOrigin: "https://vlink.example.test" }),
+    { mode: "allowlist", origins: ["https://a.example.test", "https://b.example.test"], source: "VLINK_CORS_ORIGIN" },
+  );
+  assert.deepEqual(resolveCorsPolicy({ configured: ["*"], publicOrigin: "https://vlink.example.test" }), { mode: "any", origins: ["*"], source: "VLINK_CORS_ORIGIN" });
+
+  const previous = process.env.VLINK_CORS_ORIGIN;
+  delete process.env.VLINK_CORS_ORIGIN;
+  const isolated = createApp({ publicOrigin: "https://vlink.example.test", pairingOrigin: "https://app.example.test/vlink/connect" });
+  const open = createApp({});
+  const servers = [isolated.app.listen(0, "127.0.0.1"), open.app.listen(0, "127.0.0.1")];
+  await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.once("listening", resolve))));
+  const [isolatedBase, openBase] = servers.map((server) => `http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+  try {
+    assert.equal(isolated.corsPolicy.mode, "allowlist");
+    assert.equal(open.corsPolicy.mode, "any");
+
+    const allowed = await fetch(`${isolatedBase}/api/health`, { headers: { origin: "https://app.example.test" } });
+    assert.equal(allowed.headers.get("access-control-allow-origin"), "https://app.example.test");
+    assert.equal(allowed.headers.get("vary"), "Origin");
+    const preflight = await fetch(`${isolatedBase}/api/v1/vlinks`, { method: "OPTIONS", headers: { origin: "https://vlink.example.test" } });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), "https://vlink.example.test");
+    const foreign = await fetch(`${isolatedBase}/api/health`, { headers: { origin: "https://evil.example.test" } });
+    assert.equal(foreign.status, 200);
+    assert.equal(foreign.headers.get("access-control-allow-origin"), null);
+
+    const unconfigured = await fetch(`${openBase}/api/health`, { headers: { origin: "https://anything.example.test" } });
+    assert.equal(unconfigured.headers.get("access-control-allow-origin"), "*");
+  } finally {
+    if (previous === undefined) delete process.env.VLINK_CORS_ORIGIN;
+    else process.env.VLINK_CORS_ORIGIN = previous;
+    await Promise.all(servers.map((server) => new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()))));
   }
 });
 

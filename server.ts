@@ -23,13 +23,18 @@ const lockerPhycerBaseUrl = process.env.VLINK_LOCKERPHYCER_URL?.trim() || proces
 const leaseSealer = createLeaseSealer();
 for (const line of disabledOptionalFeatures(process.env)) console.log(`[vlink] ${line}`);
 const registry = statePath ? new FileBackedVLinkRegistry({ statePath, leaseSealer }) : undefined;
-const { app, registry: activeRegistry } = createApp({
+const { app, registry: activeRegistry, corsPolicy } = createApp({
   registry,
   leaseSealer,
   lockerPhycerBaseUrl,
   publicOrigin: process.env.VLINK_PUBLIC_ORIGIN,
   pairingOrigin: process.env.VLINK_PAIRING_ORIGIN,
 });
+console.log(
+  corsPolicy.mode === "any"
+    ? `[vlink] CORS allows any origin (${corsPolicy.source}); set VLINK_CORS_ORIGIN or VLINK_PUBLIC_ORIGIN/VLINK_PAIRING_ORIGIN to restrict it`
+    : `[vlink] CORS allowlist from ${corsPolicy.source}: ${corsPolicy.origins.join(", ")}`,
+);
 installReceiptSupport(app, activeRegistry, { privateKeyPem: process.env.VLINK_RECEIPT_PRIVATE_KEY_PEM });
 installFailoverSupport(app, activeRegistry, { timeoutMs: Number(process.env.VLINK_FAILOVER_TIMEOUT_MS ?? 4_000) });
 
