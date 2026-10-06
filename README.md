@@ -146,6 +146,8 @@ Production mode requires:
 - `VLINK_LOCKERPHYCER_URL` (or `LOCKERPHYCER_URL`) for workspace identity and approval;
 - a valid `VLINK_LEASE_SEALING_KEY` (32-byte base64 or 64-character hex) for recoverable device exchange.
 
+Production startup fails closed and lists every missing required setting in one error. Optional features that the environment leaves switched off (device authorization flow, lease sealing, cAPI relay, stable receipt signing, anonymous bootstrap, custom targets, Gemini) are each logged as one `[vlink] ... disabled: ...` line at startup.
+
 Governed capability leases additionally require:
 
 ```text
@@ -173,7 +175,7 @@ holder credentials only to the configured cAPI Interlink boundary.
 | `VLINK_BOOTSTRAP_GLOBAL_LIMIT` / `VLINK_BOOTSTRAP_GLOBAL_WINDOW_SECONDS` | Anonymous bootstrap create limit across the VLink instance. Defaults to 100 requests per 3600 seconds. |
 | `VLINK_ENROLLMENT_TTL_SECONDS` | Enrollment-grant lifetime. Default `900`, clamped to at most one hour. |
 | `VLINK_ACCESS_TOKEN_TTL_SECONDS` | Temporary workload-token lifetime. Default `3600`, clamped to at most one day. |
-| `VLINK_DEVICE_FLOW_ENCRYPTION_KEY` | Enables the machine device-authorization flow (`/api/v1/device/authorizations`). Stable server secret of at least 32 bytes used to encrypt device-flow credentials at rest; when unset the flow answers `503 device_authorization_unavailable`. Keep stable across restarts. |
+| `VLINK_DEVICE_FLOW_ENCRYPTION_KEY` | Enables the machine device-authorization flow (`/api/v1/device/authorizations`). Stable server secret of at least 32 bytes used to encrypt device-flow credentials at rest; when unset the flow answers `503 device_authorization_unavailable` and startup logs `device authorization flow disabled`. Optional even in production. Keep stable across restarts. |
 | `VLINK_DEVICE_AUTHORIZATION_TTL_SECONDS` | Device-authorization request lifetime. Default `900`, clamped to at most `1800`. |
 | `VLINK_ALLOW_UNBOUND_COMPAT` | Deliberately enable unbound global compatibility traffic. Defaults off. |
 | `VLINK_ALLOW_UNAUTHENTICATED_CREATE` | Explicit override allowing unauthenticated VLink creation in production. Defaults off in production. |

@@ -7,23 +7,21 @@ import { FileBackedVLinkRegistry } from "./src/server/fileBackedRegistry";
 import { createLeaseSealer } from "./src/server/leaseSealer";
 import { installFailoverSupport } from "./src/server/failoverSupport";
 import { installReceiptSupport } from "./src/server/receiptSupport";
+import { disabledOptionalFeatures, missingProductionConfig } from "./src/server/startupConfig";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3000);
 const production = process.env.NODE_ENV === "production";
+if (production) {
+  // Fail closed: report every missing required setting at once so one restart fixes them all.
+  const missing = missingProductionConfig(process.env);
+  if (missing.length) throw new Error(`VLink refuses to start in production:\n- ${missing.join("\n- ")}`);
+}
 const statePath = process.env.VLINK_STATE_PATH?.trim();
-if (production && !statePath) {
-  throw new Error("VLINK_STATE_PATH is required in production so VLink identity and access state survive process restarts");
-}
 const lockerPhycerBaseUrl = process.env.VLINK_LOCKERPHYCER_URL?.trim() || process.env.LOCKERPHYCER_URL?.trim();
-if (production && !lockerPhycerBaseUrl) {
-  throw new Error("VLINK_LOCKERPHYCER_URL (or LOCKERPHYCER_URL) is required in production for workspace identity and approval");
-}
 const leaseSealer = createLeaseSealer();
-if (production && !leaseSealer) {
-  throw new Error("VLINK_LEASE_SEALING_KEY must be a valid 32-byte base64 or 64-character hex key in production for recoverable device exchange");
-}
+for (const line of disabledOptionalFeatures(process.env)) console.log(`[vlink] ${line}`);
 const registry = statePath ? new FileBackedVLinkRegistry({ statePath, leaseSealer }) : undefined;
 const { app, registry: activeRegistry } = createApp({
   registry,
