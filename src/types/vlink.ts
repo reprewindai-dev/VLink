@@ -54,7 +54,6 @@ export interface VLinkManifest {
   version: typeof VLINK_SCHEMA_VERSION;
   protocol: "vlink/v1";
   vlinkId: string;
-  workspaceId: string;
   environment: VLinkEnvironment;
   displayName: string;
   sourceType: VLinkSourceType;

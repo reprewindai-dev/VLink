@@ -203,6 +203,8 @@ curl -X POST http://localhost:3000/api/v1/vlinks \
 
 The creation response contains the non-secret VLink record, an expiring `vle_...` enrollment grant, and the manifest location. The enrollment grant can initiate pairing and bind a VLink lease to a CAPPO mount; it does not make CAPPO allow an action and is not consequence authority.
 
+`GET /api/v1/vlinks` and `GET /api/v1/vlinks/<vlink-id>` require a LockerPhycer workspace-bound session and return only that workspace's VLinks. The per-VLink manifest (`/api/v1/vlinks/<vlink-id>/manifest`, also `/.well-known/vlink.json?vlinkId=`) stays public for pairing discovery and omits the owning workspace.
+
 ### 2. Initiate pairing
 
 ```bash

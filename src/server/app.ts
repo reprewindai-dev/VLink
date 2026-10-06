@@ -485,16 +485,28 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.get("/api/v1/vlinks", (_req, res) => {
-    res.json({ total: registry.list().length, vlinks: registry.list() });
+  // Listing and reading VLink records is a workspace-management operation: it requires a
+  // LockerPhycer workspace identity and only ever shows the caller's own workspace.
+  app.get("/api/v1/vlinks", async (req, res) => {
+    const identity = await requireWorkspaceIdentity(req, res);
+    if (!identity) return;
+    const vlinks = registry.list().filter((vlink) => vlink.workspaceId === identity.workspaceId);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ workspaceId: identity.workspaceId, total: vlinks.length, vlinks });
   });
 
-  app.get("/api/v1/vlinks/:vlinkId", (req, res) => {
+  app.get("/api/v1/vlinks/:vlinkId", async (req, res) => {
+    const identity = await requireWorkspaceIdentity(req, res);
+    if (!identity) return;
     const vlink = registry.get(req.params.vlinkId);
-    if (!vlink) return res.status(404).json({ error: "vlink_not_found" });
+    // Another workspace's VLink is reported as absent so the ID space leaks nothing.
+    if (!vlink || vlink.workspaceId !== identity.workspaceId) return res.status(404).json({ error: "vlink_not_found" });
+    res.setHeader("Cache-Control", "no-store");
     res.json({ vlink });
   });
 
+  // The manifest stays public for pairing discovery; it carries only what a pairing
+  // device needs (see VLinkManifest) and never the owning workspace.
   app.get("/api/v1/vlinks/:vlinkId/manifest", (req, res) => {
     const manifest = registry.manifest(req.params.vlinkId);
     if (!manifest) return res.status(404).json({ error: "vlink_not_found" });

@@ -605,7 +605,6 @@ export class InMemoryVLinkRegistry implements VLinkRegistry {
       version: VLINK_SCHEMA_VERSION,
       protocol: "vlink/v1",
       vlinkId: vlink.vlinkId,
-      workspaceId: vlink.workspaceId,
       environment: vlink.environment,
       displayName: vlink.displayName,
       sourceType: vlink.sourceType,

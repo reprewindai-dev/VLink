@@ -30,9 +30,9 @@ const { app } = createApp({
   pairingOrigin: "https://app.example.test",
   workspaceAuthenticator: async (token, context) => {
     const mfaVerified = context?.requireMfa === true && context.mfaCode === "123456";
-    if (token === TEST_OWNER_TOKEN) return { workspaceId: "ws-test", mfaVerified };
-    if (token === TEST_OTHER_OWNER_TOKEN) return { workspaceId: "ws-other", mfaVerified };
-    if (token === TEST_NO_MFA_TOKEN) return { workspaceId: "ws-test", mfaVerified: false };
+    if (token === TEST_OWNER_TOKEN) return { userId: "operator-test", workspaceId: "ws-test", mfaVerified };
+    if (token === TEST_OTHER_OWNER_TOKEN) return { userId: "operator-other", workspaceId: "ws-other", mfaVerified };
+    if (token === TEST_NO_MFA_TOKEN) return { userId: "operator-test", workspaceId: "ws-test", mfaVerified: false };
     return undefined;
   },
   enableDemoResponses: true,
@@ -507,6 +507,55 @@ test("manifest is self-binding and contains no enrollment, pairing, or access se
   assert.equal(body.access.scheme, "bearer");
   assert.equal(body.access.temporaryCredentials, true);
   assert.equal(body.access.tokenPublishedInManifest, false);
+});
+
+test("public manifests omit the owning workspace on both discovery routes", async () => {
+  const created = await createVLink();
+  for (const url of [
+    `${base}/api/v1/vlinks/${created.vlink.vlinkId}/manifest`,
+    `${base}/.well-known/vlink.json?vlinkId=${created.vlink.vlinkId}`,
+  ]) {
+    const response = await fetch(url);
+    assert.equal(response.status, 200, url);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.equal(body.vlinkId, created.vlink.vlinkId);
+    assert.equal("workspaceId" in body, false, url);
+  }
+});
+
+test("VLink list and record reads require a workspace identity and stay inside the caller's workspace", async () => {
+  const mine = await createVLink();
+  const headers = (token: string) => ({ authorization: `Bearer ${token}` });
+
+  const anonymousList = await fetch(`${base}/api/v1/vlinks`);
+  assert.equal(anonymousList.status, 401);
+  assert.equal(((await anonymousList.json()) as { error: string }).error, "workspace_session_required");
+  const accessTokenList = await fetch(`${base}/api/v1/vlinks`, { headers: headers("vlt_not-a-workspace-session") });
+  assert.equal(accessTokenList.status, 401);
+  const anonymousRead = await fetch(`${base}/api/v1/vlinks/${mine.vlink.vlinkId}`);
+  assert.equal(anonymousRead.status, 401);
+
+  const ownerList = await fetch(`${base}/api/v1/vlinks`, { headers: headers(TEST_OWNER_TOKEN) });
+  assert.equal(ownerList.status, 200);
+  assert.equal(ownerList.headers.get("cache-control"), "no-store");
+  const ownerBody = (await ownerList.json()) as { workspaceId: string; total: number; vlinks: VLinkRecord[] };
+  assert.equal(ownerBody.workspaceId, "ws-test");
+  assert.equal(ownerBody.total, ownerBody.vlinks.length);
+  assert.ok(ownerBody.vlinks.some((vlink) => vlink.vlinkId === mine.vlink.vlinkId));
+  assert.ok(ownerBody.vlinks.every((vlink) => vlink.workspaceId === "ws-test"));
+
+  const otherList = await fetch(`${base}/api/v1/vlinks`, { headers: headers(TEST_OTHER_OWNER_TOKEN) });
+  assert.equal(otherList.status, 200);
+  const otherBody = (await otherList.json()) as { workspaceId: string; vlinks: VLinkRecord[] };
+  assert.equal(otherBody.workspaceId, "ws-other");
+  assert.equal(otherBody.vlinks.some((vlink) => vlink.vlinkId === mine.vlink.vlinkId), false);
+
+  const ownerRead = await fetch(`${base}/api/v1/vlinks/${mine.vlink.vlinkId}`, { headers: headers(TEST_OWNER_TOKEN) });
+  assert.equal(ownerRead.status, 200);
+  assert.equal(((await ownerRead.json()) as { vlink: VLinkRecord }).vlink.vlinkId, mine.vlink.vlinkId);
+  const otherRead = await fetch(`${base}/api/v1/vlinks/${mine.vlink.vlinkId}`, { headers: headers(TEST_OTHER_OWNER_TOKEN) });
+  assert.equal(otherRead.status, 404);
+  assert.equal(((await otherRead.json()) as { error: string }).error, "vlink_not_found");
 });
 
 
