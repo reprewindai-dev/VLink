@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import type { VLinkRegistry } from "./vlinkRegistry";
 import type { VLinkSignedReceipt } from "../types/vlink";
-import { VLinkReceiptSigner, verifyVLinkReceipt } from "./receiptSigner";
+import { VLinkReceiptSigner, verifyVLinkReceiptAgainstService } from "./receiptSigner";
 import { authenticateVLinkRequest } from "./requestProof";
 
 export interface ReceiptSupportOptions {
@@ -76,7 +76,7 @@ export const installReceiptSupport = (
     const receipt = req.body?.receipt as VLinkSignedReceipt | undefined;
     if (!receipt) return res.status(400).json({ error: "receipt_required" });
     const expectedKeyId = typeof req.body?.expectedKeyId === "string" ? req.body.expectedKeyId : undefined;
-    res.json(verifyVLinkReceipt(receipt, expectedKeyId));
+    res.json(verifyVLinkReceiptAgainstService(receipt, signer.keyDescriptor().keyId, expectedKeyId));
   });
 
   return {

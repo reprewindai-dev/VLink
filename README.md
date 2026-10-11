@@ -97,6 +97,14 @@ That does **not** yet mean full non-repudiation. A verifier that wants a stronge
 
 An ephemeral process key still produces mathematically verifiable receipts, but the operator identity of that key is not durable across restart. For a stable signing identity, configure `VLINK_RECEIPT_PRIVATE_KEY_PEM` and pin or externally anchor its published key fingerprint.
 
+Every verification answer now carries a `keyTrust` field and a `verdict`:
+
+- `pinned`: you told the verifier which key you trust (`expectedKeyId`) and the receipt was signed by it. Verdict `valid`.
+- `service_key`: you pinned nothing, but the receipt was signed by the key this VLink service holds right now (the one at `/.well-known/vlink-receipt-key.json`). Verdict `valid`.
+- `embedded_only`: the signature checks out only against the public key carried inside the receipt. That proves the receipt was not altered after signing; it does not prove who signed it, because anyone can mint a key and sign a receipt with it. Verdict `valid_unpinned_key`, never plain `valid`.
+
+Evidence class of this claim: proven by the test suite on every CI run (lab). Receipts from the public VLink service at vlink.veklom.com are production receipts; whether a given deployment has a stable operator key is disclosed by its key descriptor (`persistence: configured` or `ephemeral`).
+
 ## Not claimed / not implemented yet
 
 VLink does **not** currently claim any of the following:

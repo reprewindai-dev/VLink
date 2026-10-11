@@ -122,13 +122,30 @@ export interface VLinkReceiptKeyDescriptor {
   trustNote: string;
 }
 
+/**
+ * How much the verifier may trust the key that signed a receipt.
+ * - `pinned`: the caller named the key it trusts (`expectedKeyId`) and the receipt was signed by it.
+ * - `service_key`: no key was pinned, but the receipt was signed by the key this VLink service holds
+ *   right now (the one published at `/.well-known/vlink-receipt-key.json`).
+ * - `embedded_only`: the signature checks out only against the public key carried inside the receipt.
+ *   That proves integrity, not authorship: anyone can mint a key and sign a receipt with it.
+ */
+export type VLinkReceiptKeyTrust = "pinned" | "service_key" | "embedded_only";
+
+/** `valid` means the maths holds; `valid_unpinned_key` means the maths holds but nobody vouched for the key. */
+export type VLinkReceiptVerdict = "valid" | "valid_unpinned_key" | "invalid";
+
 export interface VLinkReceiptVerification {
   valid: boolean;
+  verdict: VLinkReceiptVerdict;
+  keyTrust: VLinkReceiptKeyTrust;
   signatureValid: boolean;
   payloadHashValid: boolean;
   keyIdValid: boolean;
   expectedKeyMatched: boolean | null;
   keyId: string;
+  /** The key this service signs with, when the verification ran on a VLink service. */
+  serviceKeyId?: string;
   reason?: string;
 }
 

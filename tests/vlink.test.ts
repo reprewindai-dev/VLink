@@ -2028,3 +2028,67 @@ test("receipt retrieval requires VLink authority and signed receipts never conta
   assert.equal(text.includes(receipt.receiptId), true);
   assert.equal(JSON.stringify(receipt).includes(credential.token), false);
 });
+
+
+test("verifying without a pinned key names the trust level: service key vs. a key embedded by a stranger", async () => {
+  const { receipt } = await createSignedTestReceipt();
+
+  // 1. Service-signed receipt, no pin: the service recognises its own key.
+  const unpinned = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt }),
+  });
+  const unpinnedResult = await unpinned.json() as { valid: boolean; verdict: string; keyTrust: string; serviceKeyId: string };
+  assert.equal(unpinnedResult.valid, true);
+  assert.equal(unpinnedResult.verdict, "valid");
+  assert.equal(unpinnedResult.keyTrust, "service_key");
+  assert.equal(unpinnedResult.serviceKeyId, receipt.keyId);
+
+  // 2. Same receipt pinned to the published key: pinned.
+  const pinned = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt, expectedKeyId: receipt.keyId }),
+  });
+  const pinnedResult = await pinned.json() as { verdict: string; keyTrust: string };
+  assert.equal(pinnedResult.verdict, "valid");
+  assert.equal(pinnedResult.keyTrust, "pinned");
+
+  // 3. A stranger re-signs the receipt with a key they made up. The maths still holds, and the
+  //    verifier must say that nobody vouched for that key instead of calling it simply valid.
+  const stranger = generateKeyPairSync("ed25519");
+  const strangerJwk = stranger.publicKey.export({ format: "jwk" }) as { kty: string; crv: string; x: string };
+  const strangerSpki = stranger.publicKey.export({ type: "spki", format: "der" });
+  const strangerKeyId = `vkey_sha256_${createHash("sha256").update(strangerSpki).digest("hex")}`;
+  const { signature: _dropped, ...unsigned } = structuredClone(receipt) as VLinkSignedReceipt;
+  const reissued = {
+    ...unsigned,
+    keyId: strangerKeyId,
+    publicKeyJwk: { kty: strangerJwk.kty, crv: strangerJwk.crv, x: strangerJwk.x },
+  };
+  const strangerSignature = ed25519Sign(null, Buffer.from(canonicalizeVLinkJson(reissued)), stranger.privateKey).toString("base64url");
+  const forged = { ...reissued, signature: strangerSignature };
+
+  const foreign = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt: forged }),
+  });
+  const foreignResult = await foreign.json() as { valid: boolean; verdict: string; keyTrust: string; signatureValid: boolean };
+  assert.equal(foreignResult.signatureValid, true, "the stranger's signature is internally consistent");
+  assert.equal(foreignResult.valid, true, "mathematical validity is unchanged");
+  assert.equal(foreignResult.verdict, "valid_unpinned_key");
+  assert.equal(foreignResult.keyTrust, "embedded_only");
+
+  // 4. Pinned to the service key, the stranger's receipt is rejected outright.
+  const foreignPinned = await fetch(`${base}/receipts/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ receipt: forged, expectedKeyId: receipt.keyId }),
+  });
+  const foreignPinnedResult = await foreignPinned.json() as { valid: boolean; verdict: string; reason: string };
+  assert.equal(foreignPinnedResult.valid, false);
+  assert.equal(foreignPinnedResult.verdict, "invalid");
+  assert.equal(foreignPinnedResult.reason, "expected_key_mismatch");
+});

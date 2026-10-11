@@ -11,7 +11,9 @@ import {
 import type {
   VLinkActivityEvent,
   VLinkReceiptKeyDescriptor,
+  VLinkReceiptKeyTrust,
   VLinkReceiptPublicKeyJwk,
+  VLinkReceiptVerdict,
   VLinkReceiptVerification,
   VLinkSignedReceipt,
 } from "../types/vlink";
@@ -132,8 +134,14 @@ export const verifyVLinkReceipt = (
       Buffer.from(signature, "base64url"),
     );
     const valid = keyIdValid && payloadHashValid && signatureValid && expectedKeyMatched !== false;
+    // A receipt carries its own public key so the maths can always be checked. Without a pinned
+    // key that only proves the receipt was not altered after signing, not who signed it. Say so.
+    const keyTrust: VLinkReceiptKeyTrust = expectedKeyMatched === true ? "pinned" : "embedded_only";
+    const verdict: VLinkReceiptVerdict = !valid ? "invalid" : keyTrust === "pinned" ? "valid" : "valid_unpinned_key";
     return {
       valid,
+      verdict,
+      keyTrust,
       signatureValid,
       payloadHashValid,
       keyIdValid,
@@ -154,6 +162,8 @@ export const verifyVLinkReceipt = (
   } catch {
     return {
       valid: false,
+      verdict: "invalid",
+      keyTrust: "embedded_only",
       signatureValid: false,
       payloadHashValid: false,
       keyIdValid: false,
@@ -162,4 +172,21 @@ export const verifyVLinkReceipt = (
       reason: "malformed_receipt",
     };
   }
+};
+
+/**
+ * Verification as performed by a running VLink service. When the caller pins no key, the receipt's
+ * key is compared with the key this service signs with, so a receipt minted elsewhere with a
+ * made-up key is reported as `embedded_only` instead of looking as good as a service-signed one.
+ */
+export const verifyVLinkReceiptAgainstService = (
+  receipt: VLinkSignedReceipt,
+  serviceKeyId: string,
+  expectedKeyId?: string,
+): VLinkReceiptVerification => {
+  const result = verifyVLinkReceipt(receipt, expectedKeyId);
+  if (result.valid && result.keyTrust === "embedded_only" && result.keyId === serviceKeyId) {
+    return { ...result, keyTrust: "service_key", verdict: "valid", serviceKeyId };
+  }
+  return { ...result, serviceKeyId };
 };
